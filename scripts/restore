@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+RESTORE_COMPAT_MANIFEST="$REPO_ROOT/config/restore-compat-paths.txt"
+PINNED_PRIVATE_RESTORE_COMPAT_SHA256=11a06a78e479d9d18530e04b00488b51e20474ab4d81672e25105c7385d7667d
+TARGET_HOME=${HOME:-}
+BACKUP=
+STATE_ROOT=
+APPLY=false
+PRIVATE_LEGACY_COMPAT=false
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/restore --backup ABSOLUTE_PATH [OPTIONS]
+
+Preview or restore a snapshot created by scripts/snapshot. Preview is the
+default. Use --apply explicitly to change the target home.
+
+Options:
+  --backup ABSOLUTE_PATH     Snapshot directory to restore
+  --home ABSOLUTE_PATH       Target home directory (default: $HOME)
+  --state-root ABSOLUTE_PATH Recovery-state root for displaced live files
+  --private-legacy-compat  Private archive only: enable the pinned legacy paths
+  --apply                    Perform the restore
+  --dry-run                  Explicitly select preview mode (default)
+  -h, --help                 Show this help
+
+Restore never deletes an existing managed target. It moves the current target
+to a timestamped restore-displaced directory before copying the snapshot.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --backup)
+            (($# >= 2)) || die "--backup requires a path"
+            BACKUP=$2
+            shift 2
+            ;;
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --state-root)
+            (($# >= 2)) || die "--state-root requires a path"
+            STATE_ROOT=$2
+            shift 2
+            ;;
+        --private-legacy-compat)
+            PRIVATE_LEGACY_COMPAT=true
+            shift
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+require_command cp
+require_command date
+require_command mv
+refuse_root
+
+[[ -n $BACKUP ]] || die "--backup is required"
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+BACKUP=$(normalize_existing_directory "$BACKUP" "snapshot")
+load_managed_paths "$MANIFEST"
+
+declare -A currently_managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    currently_managed[$relative]=1
+done
+if [[ -f $RESTORE_COMPAT_MANIFEST ]]; then
+    load_managed_paths "$RESTORE_COMPAT_MANIFEST"
+    for relative in "${MANAGED_PATHS[@]}"; do
+        currently_managed[$relative]=1
+    done
+fi
+# A private archival checkout can opt in to its two retired wallpaper paths.
+# The public restore path never discovers this manifest automatically, and the
+# pinned digest prevents an added or modified file from broadening the scope.
+if $PRIVATE_LEGACY_COMPAT; then
+    PRIVATE_RESTORE_COMPAT_MANIFEST="$REPO_ROOT/private/restore-compat-paths.txt"
+    require_command sha256sum
+    [[ -f $PRIVATE_RESTORE_COMPAT_MANIFEST ]] \
+        || die "pinned private restore compatibility manifest is unavailable"
+    [[ ! -L $PRIVATE_RESTORE_COMPAT_MANIFEST ]] \
+        || die "private restore compatibility manifest is a symlink"
+    private_manifest_digest=$(sha256sum -- "$PRIVATE_RESTORE_COMPAT_MANIFEST")
+    private_manifest_digest=${private_manifest_digest%% *}
+    [[ $private_manifest_digest == "$PINNED_PRIVATE_RESTORE_COMPAT_SHA256" ]] \
+        || die "private restore compatibility manifest does not match the pinned scope"
+    load_managed_paths "$PRIVATE_RESTORE_COMPAT_MANIFEST"
+    for relative in "${MANAGED_PATHS[@]}"; do
+        currently_managed[$relative]=1
+    done
+fi
+
+[[ -f $BACKUP/complete ]] || die "snapshot is incomplete: $BACKUP"
+[[ -f $BACKUP/format-version ]] || die "snapshot format marker is missing"
+[[ $(< "$BACKUP/format-version") == "$KDE_RICE_FORMAT_VERSION" ]] || die "unsupported snapshot format"
+[[ -f $BACKUP/managed-paths.txt ]] || die "snapshot managed-path manifest is missing"
+[[ -f $BACKUP/state.tsv ]] || die "snapshot state manifest is missing"
+[[ -d $BACKUP/payload ]] || die "snapshot payload directory is missing"
+
+# A snapshot retains the exact scope that existed when it was captured. Older
+# snapshots remain usable after current-scope additions or retirements, but a
+# snapshot can never restore a path outside the current plus restore-only exact
+# allowlists.
+load_managed_paths "$BACKUP/managed-paths.txt"
+for relative in "${MANAGED_PATHS[@]}"; do
+    [[ -n ${currently_managed[$relative]+x} ]] || die "snapshot path is not managed by this checkout: $relative"
+done
+
+declare -A expected=()
+declare -A snapshot_state=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    expected[$relative]=1
+done
+
+while IFS=$'\t' read -r state relative extra || [[ -n ${state:-} || -n ${relative:-} ]]; do
+    [[ -z ${extra:-} ]] || die "malformed snapshot state entry for: ${relative:-unknown}"
+    [[ -n ${state:-} && -n ${relative:-} ]] || die "malformed snapshot state manifest"
+    validate_relative_path "$relative" || die "unsafe path in snapshot state: $relative"
+    [[ -n ${expected[$relative]+x} ]] || die "unmanaged path in snapshot state: $relative"
+    [[ -z ${snapshot_state[$relative]+x} ]] || die "duplicate path in snapshot state: $relative"
+    case "$state" in
+        absent | file | directory | symlink)
+            ;;
+        *)
+            die "invalid snapshot state for $relative: $state"
+            ;;
+    esac
+    snapshot_state[$relative]=$state
+done < "$BACKUP/state.tsv"
+
+((${#snapshot_state[@]} == ${#MANAGED_PATHS[@]})) || die "snapshot state does not cover every managed path"
+
+for relative in "${MANAGED_PATHS[@]}"; do
+    state=${snapshot_state[$relative]}
+    payload="$BACKUP/payload/$relative"
+    assert_parent_within_home "$TARGET_HOME" "$relative"
+    assert_no_symlink_parents "$BACKUP/payload" "$relative"
+
+    if [[ $state == absent ]]; then
+        [[ ! -e $payload && ! -L $payload ]] || die "absent snapshot path has payload data: $relative"
+    else
+        [[ $(path_type "$payload") == "$state" ]] || die "snapshot payload type mismatch: $relative"
+    fi
+done
+
+printf 'Restore mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
+printf 'Snapshot: %s\n' "$BACKUP"
+printf 'Target home: %s\n\n' "$TARGET_HOME"
+
+for relative in "${MANAGED_PATHS[@]}"; do
+    current=$(path_type "$TARGET_HOME/$relative")
+    state=${snapshot_state[$relative]}
+    if [[ $state == absent ]]; then
+        if [[ $current == absent ]]; then
+            printf 'keep absent       %s\n' "$relative"
+        else
+            printf 'move aside       %s (%s -> absent)\n' "$relative" "$current"
+        fi
+    else
+        printf 'restore %-9s %s (current: %s)\n' "$state" "$relative" "$current"
+    fi
+done
+
+if ! $APPLY; then
+    printf '\nDry run only; use --apply to perform this restore.\n'
+    exit 0
+fi
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+if [[ -z $STATE_ROOT ]]; then
+    STATE_ROOT="$TARGET_HOME/.local/state/kde-rice"
+fi
+STATE_ROOT=$(normalize_output_path "$STATE_ROOT")
+case "$STATE_ROOT" in
+    "$TARGET_HOME" | "$TARGET_HOME"/*)
+        ;;
+    *)
+        die "restore state root must stay inside the target home: $STATE_ROOT"
+        ;;
+esac
+displaced="$STATE_ROOT/restore-displaced/$timestamp"
+[[ ! -e $displaced && ! -L $displaced ]] || die "restore-displaced path already exists: $displaced"
+
+umask 077
+mkdir -p -- "$displaced"
+: > "$displaced/restore-log.tsv"
+
+for relative in "${MANAGED_PATHS[@]}"; do
+    destination="$TARGET_HOME/$relative"
+    current=$(path_type "$destination")
+    state=${snapshot_state[$relative]}
+
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced/$(dirname -- "$relative")"
+        mv -- "$destination" "$displaced/$relative"
+        printf 'displaced\t%s\t%s\n' "$current" "$relative" >> "$displaced/restore-log.tsv"
+    fi
+
+    if [[ $state != absent ]]; then
+        mkdir -p -- "$TARGET_HOME/$(dirname -- "$relative")"
+        cp -a -- "$BACKUP/payload/$relative" "$destination"
+        printf 'restored\t%s\t%s\n' "$state" "$relative" >> "$displaced/restore-log.tsv"
+    else
+        printf 'restored\tabsent\t%s\n' "$relative" >> "$displaced/restore-log.tsv"
+    fi
+done
+
+printf '\nRestore complete. Previous live targets are recoverable from:\n%s\n' "$displaced"
+printf 'Plasma and KWin were not restarted automatically.\n'

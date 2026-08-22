@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+OUTPUT=json_disabled
+TARGET=minimalist-v04
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/doctor [--target NAME] [--json]
+
+Inspect this KDE session without changing it. The human-readable report is the
+default; --json emits the stable machine-readable schema. The default target
+is the current Minimalist v0.4.1 desktop and includes its native sensor and
+centered task-manager dependencies. Select an older target only for an
+isolated migration check.
+
+Options:
+  --target NAME  Capability target: minimalist-v02, minimalist-v03, or minimalist-v04
+  --json         Emit one stable JSON document
+  -h, --help     Show this help
+
+Exit codes:
+  0   supported
+  1   degraded (Plasma 6 capability set works, but is not fully confirmed)
+  2   unsupported
+  64  usage or operational error
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --target)
+            (($# >= 2)) || {
+                printf 'error: --target requires a value\n' >&2
+                usage >&2
+                exit 64
+            }
+            TARGET=$2
+            shift 2
+            ;;
+        --json)
+            OUTPUT=json
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'error: unknown argument: %s\n' "$1" >&2
+            usage >&2
+            exit 64
+            ;;
+    esac
+done
+
+case "$TARGET" in
+    minimalist-v02 | minimalist-v03 | minimalist-v04) ;;
+    *)
+        printf 'error: unsupported doctor target: %s\n' "$TARGET" >&2
+        usage >&2
+        exit 64
+        ;;
+esac
+
+doctor_test_override=false
+doctor_override_names=(
+    KDE_RICE_AVAILABLE_FONTS
+    KDE_RICE_BREEZE_DECORATION_AVAILABLE
+    KDE_RICE_BREEZE_PLASMA_STYLE_AVAILABLE
+    KDE_RICE_DBUS_TOOL
+    KDE_RICE_DISTRIBUTION_ID
+    KDE_RICE_DISTRIBUTION_LIKE
+    KDE_RICE_FASTFETCH_VERSION
+    KDE_RICE_KWIN_DECORATION_CANDIDATES
+    KDE_RICE_KWIN_DECORATION_TOOL
+    KDE_RICE_KWIN_VERSION
+    KDE_RICE_PLASMA_VERSION
+    KDE_RICE_PROJECT_PLASMOID_SOURCE
+    KDE_RICE_QDBUS_TOOL
+    KDE_RICE_RESOURCE_SENSORS_AVAILABLE
+    KDE_RICE_VOLUME_QML_AVAILABLE
+)
+for override_name in "${doctor_override_names[@]}"; do
+    if [[ -v $override_name ]]; then
+        doctor_test_override=true
+        break
+    fi
+done
+if $doctor_test_override || [[ ${KDE_RICE_TEST_MODE:-0} != 0 ]]; then
+    if [[ ${KDE_RICE_TEST_MODE:-0} != 1 ]]; then
+        printf 'error: doctor capability overrides are available only in isolated test mode\n' >&2
+        exit 64
+    fi
+    doctor_test_home=$(normalize_existing_directory "${HOME:-}" "doctor test home" 2>/dev/null) || {
+        printf 'error: isolated doctor test home could not be resolved safely\n' >&2
+        exit 64
+    }
+    doctor_test_error=
+    if ! doctor_test_error=$(require_current_desktop_home "$doctor_test_home" dbus-mock 2>&1); then
+        printf '%s\n' "$doctor_test_error" >&2
+        exit 64
+    fi
+fi
+
+declare -a CHECK_IDS=()
+declare -A CHECK_STATUS=()
+declare -A CHECK_REQUIRED=()
+declare -A CHECK_DETAIL=()
+
+add_check() {
+    local id=$1
+    local status=$2
+    local required=$3
+    local detail=$4
+
+    CHECK_IDS+=("$id")
+    CHECK_STATUS[$id]=$status
+    CHECK_REQUIRED[$id]=$required
+    CHECK_DETAIL[$id]=$detail
+}
+
+doctor_home=$(normalize_existing_directory "${HOME:-}" "doctor home" 2>/dev/null || true)
+xdg_error=
+if [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]]; then
+    user_path_check=(require_canonical_xdg_roots "$doctor_home")
+else
+    user_path_check=(require_current_desktop_home "$doctor_home")
+fi
+if [[ -n $doctor_home ]] && xdg_error=$("${user_path_check[@]}" 2>&1); then
+    add_check user_paths supported true "HOME and XDG config/data/state roots use canonical non-symlinked user paths"
+else
+    case "$xdg_error" in
+        *XDG_CONFIG_HOME*) xdg_detail="XDG_CONFIG_HOME must use the canonical non-symlinked path under HOME" ;;
+        *XDG_DATA_HOME*) xdg_detail="XDG_DATA_HOME must use the canonical non-symlinked path under HOME" ;;
+        *XDG_STATE_HOME*) xdg_detail="XDG_STATE_HOME must use the canonical non-symlinked path under HOME" ;;
+        *current*home*) xdg_detail="HOME must resolve to the current desktop account home" ;;
+        *) xdg_detail="HOME could not be resolved safely for user-local KDE paths" ;;
+    esac
+    add_check user_paths unsupported true "$xdg_detail"
+fi
+
+command_path() {
+    command -v "$1" 2>/dev/null || return 1
+}
+
+resolve_first_command() {
+    local candidate
+    for candidate in "$@"; do
+        command_path "$candidate" && return 0
+    done
+    return 1
+}
+
+resolve_override() {
+    local value=$1
+
+    [[ -n $value ]] || return 1
+    if [[ $value == */* ]]; then
+        [[ -x $value ]] || return 1
+        printf '%s\n' "$value"
+    else
+        command_path "$value"
+    fi
+}
+
+extract_version() {
+    local text=$1
+    if [[ $text =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+package_version() {
+    local package=$1
+    local output=
+
+    if command -v pacman >/dev/null 2>&1; then
+        output=$(pacman -Q "$package" 2>/dev/null) && extract_version "$output" && return 0
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        output=$(rpm -q --qf '%{VERSION}\n' "$package" 2>/dev/null) && extract_version "$output" && return 0
+    fi
+    if command -v dpkg-query >/dev/null 2>&1; then
+        output=$(dpkg-query -W -f='${Version}\n' "$package" 2>/dev/null) && extract_version "$output" && return 0
+    fi
+    return 1
+}
+
+command_version() {
+    local candidate
+    local output=
+    for candidate in "$@"; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        output=$("$candidate" --version 2>/dev/null) || continue
+        extract_version "$output" && return 0
+    done
+    return 1
+}
+
+discover_plasma_version() {
+    local version=
+    if [[ -n ${KDE_RICE_PLASMA_VERSION:-} ]]; then
+        extract_version "$KDE_RICE_PLASMA_VERSION"
+        return
+    fi
+    version=$(package_version plasma-workspace) && printf '%s\n' "$version" && return 0
+    command_version plasmashell plasma_session
+}
+
+discover_kwin_version() {
+    local version=
+    if [[ -n ${KDE_RICE_KWIN_VERSION:-} ]]; then
+        extract_version "$KDE_RICE_KWIN_VERSION"
+        return
+    fi
+    version=$(package_version kwin) && printf '%s\n' "$version" && return 0
+    version=$(package_version kwin-wayland) && printf '%s\n' "$version" && return 0
+    version=$(package_version kwin-common) && printf '%s\n' "$version" && return 0
+    command_version kwin_wayland kwin_x11
+}
+
+classify_version() {
+    local id=$1
+    local label=$2
+    local version=$3
+    local major=
+    local minor=
+
+    if [[ -z $version ]]; then
+        add_check "$id" unsupported true "$label version could not be determined"
+        return
+    fi
+    IFS=. read -r major minor _ <<< "$version"
+    if [[ $major == 6 && $minor == 7 ]]; then
+        add_check "$id" supported true "$label $version (confirmed 6.7.x range)"
+    elif [[ $major == 6 ]]; then
+        add_check "$id" degraded true "$label $version ($label 6 API range not yet confirmed)"
+    else
+        add_check "$id" unsupported true "$label $version (Plasma 6 is required)"
+    fi
+}
+
+version_at_least() {
+    local version=$1
+    local required_major=$2
+    local required_minor=$3
+    local major minor
+
+    IFS=. read -r major minor _ <<< "$version"
+    [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] || return 1
+    ((major > required_major || (major == required_major && minor >= required_minor)))
+}
+
+discover_distribution() {
+    local distribution_id=${KDE_RICE_DISTRIBUTION_ID:-}
+    local distribution_like=${KDE_RICE_DISTRIBUTION_LIKE:-}
+    local key value
+
+    if [[ -z $distribution_id && -r /etc/os-release ]]; then
+        while IFS='=' read -r key value; do
+            value=${value#\"}
+            value=${value%\"}
+            value=${value#\'}
+            value=${value%\'}
+            case "$key" in
+                ID) distribution_id=$value ;;
+                ID_LIKE) distribution_like=$value ;;
+            esac
+        done < /etc/os-release
+    fi
+    printf '%s\t%s\n' "${distribution_id:-unknown}" "${distribution_like:-none}"
+}
+
+theme_list_contains() {
+    local tool=$1
+    local pattern=$2
+    local output=
+
+    output=$("$tool" --list-themes 2>/dev/null) || return 1
+    [[ $output =~ $pattern ]]
+}
+
+check_command() {
+    local id=$1
+    local name=$2
+    if command_path "$name" >/dev/null; then
+        add_check "$id" supported true "$name is available"
+    else
+        add_check "$id" unsupported true "$name not found"
+    fi
+}
+
+font_present() {
+    local family=$1
+    local listing=
+    [[ -n ${KDE_RICE_AVAILABLE_FONTS:-} ]] && listing=$KDE_RICE_AVAILABLE_FONTS
+    if [[ -z $listing ]]; then
+        command -v fc-list >/dev/null 2>&1 || return 1
+        listing=$(fc-list "$family" family 2>/dev/null) || return 1
+    fi
+    [[ $listing == *"$family"* ]]
+}
+
+extract_panel_field() {
+    local text=$1
+    local key=$2
+    local tail
+    tail=${text#*"|$key="}
+    [[ $tail != "$text" ]] || return 1
+    printf '%s\n' "${tail%%|*}"
+}
+
+json_escape() {
+    local value=$1
+    local character
+    local ordinal
+    local index
+    local LC_ALL=C
+
+    for ((index = 0; index < ${#value}; ++index)); do
+        character=${value:index:1}
+        case "$character" in
+            '"') printf '\\"' ;;
+            '\\') printf '\\\\' ;;
+            $'\b') printf '\\b' ;;
+            $'\f') printf '\\f' ;;
+            $'\n') printf '\\n' ;;
+            $'\r') printf '\\r' ;;
+            $'\t') printf '\\t' ;;
+            *)
+                printf -v ordinal '%d' "'$character"
+                if ((ordinal < 32)); then
+                    printf '\\u%04x' "$ordinal"
+                else
+                    printf '%s' "$character"
+                fi
+                ;;
+        esac
+    done
+}
+
+IFS=$'\t' read -r distribution_id distribution_like < <(discover_distribution)
+case " $distribution_id $distribution_like " in
+    *' arch '* | *' endeavouros '* | *' fedora '* | *' debian '* | *' ubuntu '*)
+        add_check distribution supported false "maintained package-mapping family: $distribution_id (like: $distribution_like)"
+        ;;
+    *)
+        add_check distribution degraded false "capabilities may work, but no maintained package mapping exists for: $distribution_id (like: $distribution_like)"
+        ;;
+esac
+
+if [[ $TARGET == minimalist-v04 ]]; then
+    fastfetch_version=
+    if [[ -n ${KDE_RICE_FASTFETCH_VERSION:-} ]]; then
+        fastfetch_version=$(extract_version "$KDE_RICE_FASTFETCH_VERSION" 2>/dev/null || true)
+    else
+        fastfetch_version=$(command_version fastfetch 2>/dev/null || true)
+    fi
+    if [[ -z $fastfetch_version ]]; then
+        add_check fastfetch unsupported true \
+            "Fastfetch 2.40 or newer was not found; it is a linux-workstation host prerequisite outside kde-rice package ownership"
+    elif version_at_least "$fastfetch_version" 2 40; then
+        add_check fastfetch supported true \
+            "Fastfetch $fastfetch_version supports the managed medium-density JSONC presentation"
+    else
+        add_check fastfetch unsupported true \
+            "Fastfetch $fastfetch_version is older than the supported 2.40 configuration baseline"
+    fi
+
+    fastfetch_source="$REPO_ROOT/config/fastfetch/config.jsonc"
+    if [[ -f $fastfetch_source && ! -L $fastfetch_source ]]; then
+        add_check fastfetch_source supported true \
+            "project Fastfetch source is present at config/fastfetch/config.jsonc"
+    else
+        add_check fastfetch_source unsupported true \
+            "project Fastfetch source is missing or unsafe"
+    fi
+fi
+
+plasma_version=$(discover_plasma_version 2>/dev/null || true)
+kwin_version=$(discover_kwin_version 2>/dev/null || true)
+classify_version plasma_version "KDE Plasma" "$plasma_version"
+classify_version kwin_version "KWin" "$kwin_version"
+
+if [[ ${XDG_SESSION_TYPE:-} == wayland ]]; then
+    add_check wayland_session supported true "XDG_SESSION_TYPE=wayland"
+elif [[ -z ${XDG_SESSION_TYPE:-} && -n ${WAYLAND_DISPLAY:-} ]]; then
+    add_check wayland_session supported true "Wayland display ${WAYLAND_DISPLAY} is active"
+else
+    add_check wayland_session unsupported true "KWin Wayland session is required (XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset})"
+fi
+
+qdbus_tool=
+if qdbus_tool=$(resolve_override "${KDE_RICE_DBUS_TOOL:-${KDE_RICE_QDBUS_TOOL:-}}"); then
+    :
+elif qdbus_tool=$(resolve_first_command qdbus6 qdbus-qt6 qdbus); then
+    :
+fi
+if [[ -n $qdbus_tool ]]; then
+    add_check dbus_tool supported true "compatible D-Bus tool: ${qdbus_tool##*/}"
+else
+    add_check dbus_tool unsupported true "qdbus6 or a compatible D-Bus tool was not found"
+fi
+
+check_command kwriteconfig6 kwriteconfig6
+check_command kreadconfig6 kreadconfig6
+check_command plasma_apply_colorscheme plasma-apply-colorscheme
+check_command plasma_apply_desktoptheme plasma-apply-desktoptheme
+check_command konsole konsole
+
+decoration_tool=
+if [[ -n ${KDE_RICE_KWIN_DECORATION_TOOL:-} ]]; then
+    decoration_tool=$(resolve_override "$KDE_RICE_KWIN_DECORATION_TOOL" 2>/dev/null || true)
+elif decoration_tool=$(command_path kwin-applywindowdecoration); then
+    :
+else
+    decoration_candidates=${KDE_RICE_KWIN_DECORATION_CANDIDATES:-/usr/lib/kwin-applywindowdecoration:/usr/lib64/kwin-applywindowdecoration:/usr/libexec/kwin-applywindowdecoration:/usr/libexec/kf6/kwin-applywindowdecoration:/usr/lib/qt6/libexec/kwin-applywindowdecoration:/usr/lib64/qt6/libexec/kwin-applywindowdecoration:/usr/lib/x86_64-linux-gnu/libexec/kwin-applywindowdecoration}
+    IFS=: read -r -a decoration_candidate_list <<< "$decoration_candidates"
+    for candidate in "${decoration_candidate_list[@]}"; do
+        if [[ -x $candidate ]]; then
+            decoration_tool=$candidate
+            break
+        fi
+    done
+fi
+if [[ -n $decoration_tool ]]; then
+    add_check kwin_decoration_tool supported true "KWin Breeze decoration apply tool: ${decoration_tool##*/}"
+else
+    add_check kwin_decoration_tool unsupported true "kwin-applywindowdecoration was not found in PATH or official lib/libexec locations"
+fi
+
+plasma_style_tool=$(command_path plasma-apply-desktoptheme 2>/dev/null || true)
+if [[ ${KDE_RICE_BREEZE_PLASMA_STYLE_AVAILABLE:-} == true ]]; then
+    add_check breeze_plasma_style supported true "Breeze Plasma Style (theme name: default) is available"
+elif [[ ${KDE_RICE_BREEZE_PLASMA_STYLE_AVAILABLE:-} == false ]]; then
+    add_check breeze_plasma_style unsupported true "Breeze Plasma Style (theme name: default) is unavailable"
+elif [[ -n $plasma_style_tool ]] \
+    && theme_list_contains "$plasma_style_tool" '(^|[[:space:](])default([[:space:])]|$)'; then
+    add_check breeze_plasma_style supported true "Breeze Plasma Style (theme name: default) is listed by the apply tool"
+else
+    add_check breeze_plasma_style unsupported true "Breeze Plasma Style (theme name: default) could not be listed"
+fi
+
+if [[ ${KDE_RICE_BREEZE_DECORATION_AVAILABLE:-} == true ]]; then
+    add_check breeze_window_decoration supported true "Breeze window decoration is available"
+elif [[ ${KDE_RICE_BREEZE_DECORATION_AVAILABLE:-} == false ]]; then
+    add_check breeze_window_decoration unsupported true "Breeze window decoration is unavailable"
+elif [[ -n $decoration_tool ]] \
+    && theme_list_contains "$decoration_tool" '(^|[[:space:](])Breeze([[:space:])]|$)'; then
+    add_check breeze_window_decoration supported true "Breeze window decoration is listed by the apply tool"
+else
+    add_check breeze_window_decoration unsupported true "Breeze window decoration could not be listed"
+fi
+
+missing_fonts=()
+for family in "Hack" "Noto Sans"; do
+    font_present "$family" || missing_fonts+=("$family")
+done
+if ((${#missing_fonts[@]} == 0)); then
+    add_check fonts supported true "Hack; Noto Sans"
+else
+    missing_text=$(IFS='; '; printf '%s' "${missing_fonts[*]}")
+    add_check fonts unsupported true "missing font families: $missing_text"
+fi
+
+if [[ $TARGET == minimalist-v03 || $TARGET == minimalist-v04 ]]; then
+    resource_sensor_qml=
+    resource_cpu_plugin=
+    resource_memory_plugin=
+    resource_gpu_plugin=
+    volume_qml_module=
+    if [[ ${KDE_RICE_RESOURCE_SENSORS_AVAILABLE:-} == true ]]; then
+        add_check resource_sensors supported true "KSystemStats CPU/memory sensors and LibKSysGuard QML module are available"
+        add_check gpu_sensor supported false "KSystemStats GPU sensor availability is accepted by test override"
+    elif [[ ${KDE_RICE_RESOURCE_SENSORS_AVAILABLE:-} == false ]]; then
+        add_check resource_sensors unsupported true "KSystemStats CPU/memory sensors or LibKSysGuard QML module are unavailable"
+        add_check gpu_sensor supported false "GPU is optional and its label will remain hidden"
+    else
+        if command -v ksystemstats >/dev/null 2>&1; then
+            resource_sensor_qml=$(find /usr/lib /usr/lib64 \
+                -path '*/qml/org/kde/ksysguard/sensors/qmldir' -type f -print -quit 2>/dev/null)
+            resource_cpu_plugin=$(find /usr/lib /usr/lib64 \
+                -path '*/plugins/ksystemstats/ksystemstats_plugin_cpu.so' -type f -print -quit 2>/dev/null)
+            resource_memory_plugin=$(find /usr/lib /usr/lib64 \
+                -path '*/plugins/ksystemstats/ksystemstats_plugin_memory.so' -type f -print -quit 2>/dev/null)
+            resource_gpu_plugin=$(find /usr/lib /usr/lib64 \
+                -path '*/plugins/ksystemstats/ksystemstats_plugin_gpu.so' -type f -print -quit 2>/dev/null)
+        fi
+        if [[ -n $resource_sensor_qml && -n $resource_cpu_plugin && -n $resource_memory_plugin ]]; then
+            add_check resource_sensors supported true "KSystemStats CPU/memory plugins and LibKSysGuard QML sensor module are available"
+        else
+            add_check resource_sensors unsupported true "KSystemStats CPU/memory plugins or LibKSysGuard QML sensor module are unavailable"
+        fi
+        if [[ -n $resource_gpu_plugin ]]; then
+            add_check gpu_sensor supported false "KSystemStats GPU plugin is available; runtime sensor readiness remains conditional"
+        else
+            add_check gpu_sensor supported false "KSystemStats GPU plugin is absent; the resource strip will hide the GPU label"
+        fi
+    fi
+
+    if [[ ${KDE_RICE_VOLUME_QML_AVAILABLE:-} == true ]]; then
+        add_check volume_backend supported true \
+            "KDE Plasma event-driven volume QML backend is available"
+    elif [[ ${KDE_RICE_VOLUME_QML_AVAILABLE:-} == false ]]; then
+        add_check volume_backend unsupported true \
+            "KDE Plasma event-driven volume QML backend is unavailable"
+    else
+        volume_qml_module=$(find /usr/lib /usr/lib64 \
+            -path '*/qml/org/kde/plasma/private/volume/qmldir' -type f -print -quit 2>/dev/null)
+        if [[ -n $volume_qml_module ]] \
+            && grep -q '^plugin plasma-volume-declarative$' "$volume_qml_module" 2>/dev/null; then
+            add_check volume_backend supported true \
+                "KDE Plasma event-driven volume QML backend is available"
+        else
+            add_check volume_backend unsupported true \
+                "KDE Plasma event-driven volume QML backend is unavailable"
+        fi
+    fi
+fi
+
+panel_probe_path="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v02/contents/panel-state.js"
+panel_probe=
+[[ -f $panel_probe_path ]] && panel_probe=$(< "$panel_probe_path")
+panel_result=
+panel_ok=false
+if [[ -n $qdbus_tool && -n $panel_probe ]]; then
+    if panel_result=$("$qdbus_tool" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$panel_probe" 2>/dev/null); then
+        panel_result=$(normalize_plasma_probe_output "$panel_result")
+        if [[ $panel_result == *KDE_RICE_PANEL_STATE_JSON=* && $panel_result == *KDE_RICE_PANEL_STATE\ schema=1* ]]; then
+            panel_ok=true
+        fi
+    fi
+fi
+
+if $panel_ok; then
+    add_check plasmashell supported true "org.kde.plasmashell scripting API is accessible"
+    panel_marker=$(printf '%s\n' "$panel_result" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q;}')
+    panel_count=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* panelCount=([^ ]+).*/\1/p')
+    desktop_count=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* desktopCount=([^ ]+).*/\1/p')
+    panel_signature=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* signature=([^ ]+).*/\1/p')
+    panel_transition=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* transition=([^ ]+).*/\1/p')
+    panel_geometry=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* geometry=([^ ]+).*/\1/p')
+    builtins_known=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* knownBuiltInWidgets=([^ ]+).*/\1/p')
+    missing_builtins=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* missingBuiltInWidgets=([^ ]+).*/\1/p')
+    icon_tasks_known=$(printf '%s\n' "$panel_marker" | sed -nE 's/.* iconTasksKnown=([^ ]+).*/\1/p')
+    project_plasmoid=${KDE_RICE_PROJECT_PLASMOID_SOURCE:-$REPO_ROOT/plasmoids/org.kde.minimalist.activewindowtitle}
+    resource_plasmoid="$REPO_ROOT/plasmoids/org.kde.minimalist.resources"
+    workspace_plasmoid="$REPO_ROOT/plasmoids/org.kde.minimalist.workspaces"
+    resource_source_ok=true
+    if [[ $TARGET == minimalist-v03 || $TARGET == minimalist-v04 ]]; then
+        [[ -d $resource_plasmoid && -f $resource_plasmoid/metadata.json \
+            && -f $resource_plasmoid/contents/ui/main.qml ]] || resource_source_ok=false
+    fi
+    v04_layout="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v04"
+    v04_source_ok=true
+    if [[ $TARGET == minimalist-v04 ]]; then
+        [[ -d $v04_layout && -f $v04_layout/metadata.json \
+            && -f $v04_layout/contents/preflight.js \
+            && -f $v04_layout/contents/layout.js \
+            && -f $v04_layout/contents/postcheck.js \
+            && -f $v04_layout/contents/pager-preflight.js \
+            && -f $v04_layout/contents/pager-layout.js \
+            && -f $v04_layout/contents/pager-postcheck.js \
+            && -f $v04_layout/contents/pager-cleanup.js \
+            && -f $v04_layout/contents/workspaces-preflight.js \
+            && -f $v04_layout/contents/workspaces-layout.js \
+            && -f $v04_layout/contents/workspaces-postcheck.js \
+            && -f $v04_layout/contents/workspaces-cleanup.js \
+            && -d $workspace_plasmoid \
+            && -f $workspace_plasmoid/metadata.json \
+            && -f $workspace_plasmoid/contents/ui/main.qml ]] || v04_source_ok=false
+    fi
+    if [[ -d $project_plasmoid && -f $project_plasmoid/metadata.json && -f $project_plasmoid/contents/ui/main.qml \
+        && $resource_source_ok == true && $v04_source_ok == true && $builtins_known == true \
+        && ( $TARGET != minimalist-v04 || $icon_tasks_known == true ) ]]; then
+        if [[ $TARGET == minimalist-v04 ]]; then
+            add_check widgets supported true "required built-in widgets including Icons-only Task Manager are available; v0.4.1 project sources are complete"
+        elif [[ $TARGET == minimalist-v03 ]]; then
+            add_check widgets supported true "required built-in widgets are available; v0.2 and v0.3 project Plasmoid sources are complete"
+        else
+            add_check widgets supported true "required built-in widgets are available; v0.2 project Plasmoid source is complete"
+        fi
+    else
+        widget_detail=
+        if [[ $builtins_known != true ]]; then
+            if [[ -n $missing_builtins && $missing_builtins != none ]]; then
+                widget_detail="missing required built-in widgets: $missing_builtins"
+            else
+                widget_detail="required built-in widget inventory is incomplete"
+            fi
+        fi
+        [[ -d $project_plasmoid && -f $project_plasmoid/metadata.json && -f $project_plasmoid/contents/ui/main.qml ]] \
+            || widget_detail="${widget_detail:+$widget_detail; }project Plasmoid source is incomplete"
+        if [[ ( $TARGET == minimalist-v03 || $TARGET == minimalist-v04 ) \
+            && $resource_source_ok != true ]]; then
+            widget_detail="${widget_detail:+$widget_detail; }resource Plasmoid source is incomplete"
+        fi
+        if [[ $TARGET == minimalist-v04 && $icon_tasks_known != true ]]; then
+            widget_detail="${widget_detail:+$widget_detail; }required built-in widget is unavailable: org.kde.plasma.icontasks"
+        fi
+        if [[ $TARGET == minimalist-v04 && $v04_source_ok != true ]]; then
+            widget_detail="${widget_detail:+$widget_detail; }v0.4.1 layout source is incomplete"
+        fi
+        add_check widgets unsupported true "$widget_detail"
+    fi
+
+    if [[ ! $panel_count =~ ^[0-9]+$ || -z $panel_signature || -z $panel_transition ]]; then
+        add_check panels unsupported true "plasmashell returned a malformed panel inventory"
+        add_check panel_opacity_transition unsupported true \
+            "panel opacity transition safety could not be determined"
+    else
+        case "$panel_signature" in
+            plasma6-stock | plasma6-stock-ime | minimalist-v01 \
+                | minimalist-v02-show-desktop | minimalist-v02-no-title \
+                | minimalist-v02-spacer-repair | minimalist-v02-title-repair \
+                | minimalist-v02 | minimalist-v03 | minimalist-v04-spacer-staged \
+                | minimalist-v04-task-front-staged \
+                | minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces)
+                add_check panels supported true "count=$panel_count topology=$panel_signature transition=$panel_transition"
+                ;;
+            *)
+                add_check panels unsupported true "count=$panel_count topology=unknown; no exact safe transition exists"
+                ;;
+        esac
+        case "$panel_signature" in
+            plasma6-stock | plasma6-stock-ime)
+                if [[ $plasma_version == 6.7.* ]]; then
+                    add_check panel_opacity_transition degraded true \
+                        "Plasma $plasma_version fresh-panel opacity requires a documented manual Opaque confirmation before receipt resume"
+                else
+                    add_check panel_opacity_transition degraded true \
+                        "fresh-panel opacity scripting is not live-confirmed for Plasma ${plasma_version:-unknown}"
+                fi
+                ;;
+            minimalist-v01 | minimalist-v02-show-desktop | minimalist-v02-no-title \
+                | minimalist-v02-spacer-repair | minimalist-v02-title-repair \
+                | minimalist-v02 | minimalist-v03 | minimalist-v04-spacer-staged \
+                | minimalist-v04-task-front-staged \
+                | minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces)
+                if [[ $panel_geometry == *,opaque,* ]]; then
+                    add_check panel_opacity_transition supported false \
+                        "recognized managed panel already reports Opaque"
+                elif [[ $plasma_version == 6.7.* ]]; then
+                    add_check panel_opacity_transition degraded true \
+                        "Plasma $plasma_version managed panel is not Opaque and requires manual Opaque confirmation before receipt resume"
+                else
+                    add_check panel_opacity_transition degraded true \
+                        "managed panel opacity transition is not live-confirmed for Plasma ${plasma_version:-unknown}"
+                fi
+                ;;
+            *)
+                add_check panel_opacity_transition unsupported true \
+                    "unknown panel topology has no safe opacity transition"
+                ;;
+        esac
+    fi
+    if [[ $desktop_count =~ ^[0-9]+$ ]] && ((desktop_count == 1)); then
+        add_check monitors supported false "one Plasma desktop containment is active"
+    elif [[ $desktop_count =~ ^[0-9]+$ ]] && ((desktop_count > 1)); then
+        add_check monitors degraded false "$desktop_count Plasma desktop containments detected; multi-monitor layout is not live-validated"
+    elif [[ $desktop_count =~ ^[0-9]+$ ]]; then
+        add_check monitors unsupported true "no active Plasma desktop containment was reported"
+    else
+        add_check monitors degraded false "active Plasma desktop-containment count could not be determined"
+    fi
+else
+    add_check plasmashell unsupported true "org.kde.plasmashell scripting API is not accessible"
+    add_check widgets unsupported true "built-in widget availability could not be queried from plasmashell"
+    add_check panels unsupported true "panel inventory could not be queried"
+    add_check panel_opacity_transition unsupported true \
+        "panel opacity transition safety could not be determined"
+    add_check monitors unsupported true "monitor topology could not be queried from plasmashell"
+fi
+
+supported_count=0
+degraded_count=0
+unsupported_count=0
+for id in "${CHECK_IDS[@]}"; do
+    case "${CHECK_STATUS[$id]}" in
+        supported) ((supported_count += 1)) ;;
+        degraded) ((degraded_count += 1)) ;;
+        unsupported) ((unsupported_count += 1)) ;;
+        *)
+            printf 'error: internal doctor status for %s is invalid\n' "$id" >&2
+            exit 64
+            ;;
+    esac
+done
+
+if ((unsupported_count > 0)); then
+    overall=unsupported
+    exit_code=2
+elif ((degraded_count > 0)); then
+    overall=degraded
+    exit_code=1
+else
+    overall=supported
+    exit_code=0
+fi
+
+if [[ $OUTPUT == json ]]; then
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "status": "%s",\n' "$overall"
+    printf '  "exit_code": %d,\n' "$exit_code"
+    printf '  "summary": {"supported": %d, "degraded": %d, "unsupported": %d},\n' "$supported_count" "$degraded_count" "$unsupported_count"
+    printf '  "checks": {\n'
+    for ((index = 0; index < ${#CHECK_IDS[@]}; index++)); do
+        id=${CHECK_IDS[$index]}
+        printf '    "%s": {"status": "%s", "required": %s, "detail": "' "$id" "${CHECK_STATUS[$id]}" "${CHECK_REQUIRED[$id]}"
+        json_escape "${CHECK_DETAIL[$id]}"
+        if ((index + 1 == ${#CHECK_IDS[@]})); then
+            printf '"}\n'
+        else
+            printf '"},\n'
+        fi
+    done
+    printf '  }\n'
+    printf '}\n'
+else
+    printf 'KDE Rice Doctor\n'
+    printf 'Status: %s\n' "$overall"
+    printf 'Exit code: %d\n\n' "$exit_code"
+    for id in "${CHECK_IDS[@]}"; do
+        case "${CHECK_STATUS[$id]}" in
+            supported) marker=OK ;;
+            degraded) marker=WARN ;;
+            unsupported) marker=FAIL ;;
+        esac
+        printf '[%-4s] %-28s %s\n' "$marker" "$id" "${CHECK_DETAIL[$id]}"
+    done
+    printf '\nSummary: supported=%d degraded=%d unsupported=%d\n' "$supported_count" "$degraded_count" "$unsupported_count"
+fi
+
+exit "$exit_code"

@@ -1,0 +1,9 @@
+{
+    "KPackageStructure": "Plasma/LayoutTemplate",
+    "KPlugin": {
+        "Description": "Add a compact native-sensor resource strip to Minimalist v0.2",
+        "Id": "org.kde.minimalist-v03",
+        "License": "MIT",
+        "Name": "Minimalist v0.3 Resource Status Strip"
+    }
+}

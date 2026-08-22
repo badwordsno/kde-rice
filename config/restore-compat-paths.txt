@@ -1,0 +1,14 @@
+# Retired exact paths accepted only when restoring an older trusted snapshot.
+#
+# Snapshot and apply commands never read this file and never add these paths to
+# new managed state. Keeping this narrow allowlist preserves rollback for
+# snapshots created before Minimalist became the sole active direction.
+
+.local/share/color-schemes/RetroWorkstation.colors
+.local/share/konsole/RetroWorkstation.colorscheme
+.local/share/konsole/RetroWorkstation.profile
+.local/share/plasma/desktoptheme/retro-workstation
+.local/share/aurorae/themes/retro-workstation
+.local/share/wallpapers/RetroWorkstationEOS
+.local/share/plasma/layout-templates/org.kde.retro-workstation
+.local/share/plasma/layout-templates/org.kde.black-minimal-compact-panel

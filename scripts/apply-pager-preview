@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+KWIN_CONFIG_RELATIVE=".config/kwinrc"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-pager-preview [OPTIONS]
+
+Preview or apply the optional Minimalist v0.4.1 virtual-desktop Pager. The
+guarded apply creates three KWin virtual desktops (four total, one row), adds
+one built-in Pager after the launcher, and displays desktop numbers.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot and apply the Pager preview
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded apply
+  -h, --help            Show this help
+
+Only an exact 32px Minimalist v0.4.1 base (one desktop) or the exact Pager
+target (four desktops) is accepted. Plasma and KWin are never restarted.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+for command_name in realpath cp date mv mkdir diff sleep jq; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_KWIN_BUSCTL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal Pager-preview overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; Pager preview is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+KWIN_BUSCTL=${KDE_RICE_KWIN_BUSCTL:-}
+if [[ -z $KWIN_BUSCTL ]]; then
+    KWIN_BUSCTL=$(command -v busctl 2>/dev/null || true)
+fi
+[[ -n $KWIN_BUSCTL && -x $KWIN_BUSCTL ]] \
+    || die "busctl is required for guarded KWin virtual-desktop changes"
+
+load_managed_paths "$MANIFEST"
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$PANEL_CONFIG_RELATIVE" "$KWIN_CONFIG_RELATIVE"; do
+    validate_relative_path "$target_relative" || die "unsafe Pager-preview target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] \
+        || die "Pager-preview target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+
+layout_source="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+[[ -d $layout_source && ! -L $layout_source ]] \
+    || die "v0.4.1 layout source is missing or unsafe"
+for source_file in pager-preflight.js pager-layout.js pager-postcheck.js pager-cleanup.js; do
+    [[ -f $layout_source/contents/$source_file && ! -L $layout_source/contents/$source_file ]] \
+        || die "v0.4.1 Pager-preview source is incomplete: $source_file"
+done
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+kwin_property_json() {
+    "$KWIN_BUSCTL" --user --json=short get-property org.kde.KWin \
+        /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager "$1"
+}
+
+json_scalar_number() {
+    jq -er '.data | if type == "array" then .[0] else . end | select(type == "number")'
+}
+
+read_kwin_state() {
+    KWIN_COUNT=$(kwin_property_json count | json_scalar_number) \
+        || die "KWin virtual-desktop count reply is unavailable or malformed"
+    KWIN_ROWS=$(kwin_property_json rows | json_scalar_number) \
+        || die "KWin virtual-desktop row reply is unavailable or malformed"
+    KWIN_DESKTOPS_JSON=$(kwin_property_json desktops) \
+        || die "KWin virtual-desktop inventory is unavailable"
+    printf '%s\n' "$KWIN_DESKTOPS_JSON" | jq -e \
+        --argjson count "$KWIN_COUNT" '.data | type == "array" and length == $count' >/dev/null \
+        || die "KWin virtual-desktop inventory does not match its count"
+}
+
+printf 'Minimalist Pager preview mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\n1. Current topology and KWin state (read-only)\n'
+preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/pager-preflight.js")")
+printf '%s\n' "$preflight"
+[[ $preflight == *MINIMALIST_PAGER_PREFLIGHT_OK* \
+    && $preflight == *" height=32 "* \
+    && $preflight == *" geometryOk=true "* \
+    && $preflight == *" anchorReady=true "* \
+    && $preflight == *" pagerKnown=true "* ]] \
+    || die "Pager preview requires the exact 32px v0.4.1 base or Pager target"
+if [[ $preflight == *" topology=minimalist-v04 "* ]]; then
+    initial_topology=minimalist-v04
+elif [[ $preflight == *" topology=minimalist-v04-pager "* ]]; then
+    initial_topology=minimalist-v04-pager
+else
+    die "Pager preview preflight returned an unknown topology"
+fi
+read_kwin_state
+if [[ $initial_topology == minimalist-v04 ]]; then
+    [[ $KWIN_COUNT == 1 && $KWIN_ROWS == 1 ]] \
+        || die "base panel requires exactly one KWin desktop in one row"
+else
+    [[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+        || die "Pager target requires exactly four KWin desktops in one row"
+fi
+printf 'KWin virtual desktops: count=%s rows=%s\n' "$KWIN_COUNT" "$KWIN_ROWS"
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-pager-preview-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\n2. Complete change plan\n'
+printf '  current accepted topology: %s on one screen-0 top panel at 32 logical px\n' "$initial_topology"
+printf '  current KWin topology: %s virtual desktop(s), one horizontal row\n' "$KWIN_COUNT"
+printf '  managed asset write: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed configs that may change: %s; %s\n' "$KWIN_CONFIG_RELATIVE" "$PANEL_CONFIG_RELATIVE"
+if [[ $initial_topology == minimalist-v04 ]]; then
+    printf '  virtual desktop additions: exactly three (positions 2-4; labels 2, 3, 4)\n'
+    printf '  panel additions: one built-in org.kde.plasma.pager after the launcher and before the active title\n'
+else
+    printf '  virtual desktop additions: none (exact four-desktop target already present)\n'
+    printf '  panel additions: none (the exact one-Pager target already exists)\n'
+fi
+printf '  Pager General writes: displayedText=0 (numbers), showWindowOutlines=false, showWindowIcons=false\n'
+printf '  panel removals: none\n'
+printf '  existing widget removals, moves, and resizes: none; panel remains 32 logical px\n'
+printf '  preserve: current desktop identity/name, existing widgets/config/order, pinned apps, wallpaper, shortcuts, and display modes\n'
+printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
+printf '  snapshot destination: %s\n' "$snapshot_path"
+printf '  automatic failure rollback: remove only this transaction\047s Pager/desktop IDs, then restore the complete snapshot\n'
+printf '  later manual rollback preview: %s\n' "$restore_preview"
+printf '  later manual rollback apply: %s (then log out/in so Plasma and KWin reload restored live state)\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, layout asset, panel, Pager, virtual desktop, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n3. Capturing the complete managed scope before the first write\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+created_desktop_ids=()
+pager_write_attempted=false
+apply_error() {
+    local status=$?
+    local cleanup_result=
+    local index
+    local desktop_id
+    local restore_status=0
+    trap - EXIT
+    set +e
+    warn "Pager preview stopped after an error; Plasma and KWin were not restarted"
+    if [[ $initial_topology == minimalist-v04 && $pager_write_attempted == true ]]; then
+        cleanup_result=$(evaluate_plasma_script "$(< "$layout_source/contents/pager-cleanup.js")" 2>&1)
+        if [[ $cleanup_result == *MINIMALIST_PAGER_CLEANUP_OK* ]]; then
+            warn "transaction Pager was removed from the live panel"
+        else
+            warn "live Pager cleanup could not prove a safe exact target; no unrelated widget was removed"
+        fi
+    fi
+    for ((index = ${#created_desktop_ids[@]} - 1; index >= 0; --index)); do
+        desktop_id=${created_desktop_ids[$index]}
+        if kwin_property_json desktops | jq -e --arg id "$desktop_id" \
+            '.data | map(.[1]) | index($id) != null' >/dev/null 2>&1; then
+            "$KWIN_BUSCTL" --user call org.kde.KWin /VirtualDesktopManager \
+                org.kde.KWin.VirtualDesktopManager removeDesktop s "$desktop_id" >/dev/null 2>&1 \
+                || warn "could not remove one transaction-created virtual desktop"
+        fi
+    done
+    "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
+    restore_status=$?
+    if ((restore_status == 0)); then
+        warn "pre-apply managed files were restored automatically"
+    else
+        warn "automatic snapshot restore failed; use: $restore_apply"
+    fi
+    exit "$status"
+}
+trap apply_error EXIT
+
+printf '\n4. Refreshing only the exact v0.4.1 layout-template asset\n'
+umask 077
+temporary="$layout_destination.kde-rice-new-$$"
+current=$(path_type "$layout_destination")
+[[ $current != unsupported ]] || die "managed layout target has an unsupported type"
+[[ ! -e $temporary && ! -L $temporary ]] \
+    || die "temporary layout install path already exists: $temporary"
+mkdir -p -- "$(dirname -- "$layout_destination")"
+cp -a -- "$layout_source" "$temporary"
+if [[ $current != absent ]]; then
+    mkdir -p -- "$displaced_path/$(dirname -- "$LAYOUT_TARGET_RELATIVE")"
+    mv -- "$layout_destination" "$displaced_path/$LAYOUT_TARGET_RELATIVE"
+fi
+mv -- "$temporary" "$layout_destination"
+diff -qr -- "$layout_source" "$layout_destination" >/dev/null \
+    || die "installed v0.4.1 layout differs from its source"
+
+printf '\n5. Rechecking panel and KWin topology before the first live write\n'
+write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/pager-preflight.js")")
+printf '%s\n' "$write_preflight"
+[[ $write_preflight == *MINIMALIST_PAGER_PREFLIGHT_OK* \
+    && $write_preflight == *" topology=$initial_topology "* ]] \
+    || die "panel changed before the guarded Pager write"
+read_kwin_state
+if [[ $initial_topology == minimalist-v04 ]]; then
+    [[ $KWIN_COUNT == 1 && $KWIN_ROWS == 1 ]] \
+        || die "KWin desktops changed before the guarded write"
+else
+    [[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+        || die "KWin desktops changed before the guarded write"
+fi
+
+if [[ $initial_topology == minimalist-v04 ]]; then
+    printf '\n6. Creating exactly three KWin virtual desktops\n'
+    for position in 1 2 3; do
+        temporary_name="kde-rice-$apply_id-$position"
+        before_desktop_ids=$(printf '%s\n' "$KWIN_DESKTOPS_JSON" | jq -c \
+            '[.data[][1]]') \
+            || die "could not preserve the pre-create KWin desktop ID set"
+        "$KWIN_BUSCTL" --user --json=short call org.kde.KWin \
+            /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager \
+            createDesktop us "$position" "$temporary_name" >/dev/null \
+            || die "KWin refused virtual desktop $((position + 1))"
+        read_kwin_state
+        [[ $KWIN_COUNT == $((position + 1)) && $KWIN_ROWS == 1 ]] \
+            || die "KWin desktop topology diverged during creation"
+        new_desktop_ids=$(printf '%s\n' "$KWIN_DESKTOPS_JSON" | jq -c \
+            --argjson before "$before_desktop_ids" '[.data[][1]] - $before') \
+            || die "could not compare the post-create KWin desktop ID set"
+        [[ $(printf '%s\n' "$new_desktop_ids" | jq -r 'length') == 1 ]] \
+            || die "KWin did not expose exactly one transaction-created desktop ID"
+        desktop_id=$(printf '%s\n' "$new_desktop_ids" | jq -er \
+            '.[0] | select(type == "string" and length > 0)') \
+            || die "KWin exposed a malformed created-desktop ID"
+        created_desktop_ids+=("$desktop_id")
+        "$KWIN_BUSCTL" --user call org.kde.KWin /VirtualDesktopManager \
+            org.kde.KWin.VirtualDesktopManager setDesktopName ss \
+            "$desktop_id" "$((position + 1))" >/dev/null \
+            || die "KWin refused the numeric desktop label"
+    done
+else
+    printf '\n6. Exact four-desktop KWin target already present; no desktop is created\n'
+fi
+
+printf '\n7. Adding/configuring the built-in Pager at the guarded launcher anchor\n'
+pager_write_attempted=true
+layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/pager-layout.js")")
+printf '%s\n' "$layout_result"
+[[ $layout_result == *MINIMALIST_PAGER_LAYOUT_OK* ]] \
+    || die "Plasma did not confirm the Pager layout write"
+
+printf '\n8. Read-only Pager and KWin postcheck\n'
+post_result=
+for attempt in {1..20}; do
+    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/pager-postcheck.js")")
+    [[ $post_result == *MINIMALIST_PAGER_POSTCHECK_OK* ]] && break
+    ((attempt == 20)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_PAGER_POSTCHECK_OK* ]] \
+    || die "live Pager topology or policy did not settle to the exact target"
+read_kwin_state
+[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+    || die "live KWin topology did not settle to four desktops in one row"
+
+printf '\n9. Repository read-only verification\n'
+set +e
+verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
+    --panel-target minimalist-v04-pager --json 2>&1)
+verify_status=$?
+set -e
+printf '%s\n' "$verify_output"
+verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
+    '[.checks[] | select(.name != "display_configuration_unchanged" and .ok != true)] | length' \
+    2>/dev/null) || die "repository verification output was malformed"
+((verify_non_display_failures == 0)) \
+    || die "repository verification found an in-scope mismatch"
+if ((verify_status != 0)); then
+    warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
+fi
+
+trap - EXIT
+printf '\nMinimalist Pager preview apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced layout asset: %s\n' "$displaced_path"
+fi
+printf 'Result: four horizontal virtual desktops and one numbered built-in Pager after the launcher.\n'
+printf 'No existing widget, panel geometry, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'

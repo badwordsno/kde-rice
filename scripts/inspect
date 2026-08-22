@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/inspect [--home ABSOLUTE_PATH]
+
+Read-only inventory of the KDE files managed by this project. Display and
+refresh-rate configuration is reported only as excluded; its contents are not
+read.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+refuse_root
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+load_managed_paths "$MANIFEST"
+
+printf 'KDE rice managed-scope inspection\n'
+printf 'Repository: %s\n' "$REPO_ROOT"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf 'Session type: %s\n' "${XDG_SESSION_TYPE:-unknown}"
+
+if command -v pacman >/dev/null 2>&1; then
+    printf 'Packages:\n'
+    pacman -Q plasma-workspace kwin 2>/dev/null || printf '  Plasma package versions unavailable\n'
+fi
+
+printf '\nManaged paths\n'
+print_managed_paths "$TARGET_HOME"
+
+printf '\nExplicitly excluded display paths\n'
+for relative in .config/kwinoutputconfig.json .local/share/kscreen; do
+    printf '%-9s %s\n' "$(path_type "$TARGET_HOME/$relative")" "$relative"
+done
+
+printf '\nPolicy: display modes, scaling, VRR, HDR, and refresh rates are never managed.\n'

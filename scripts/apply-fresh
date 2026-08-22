@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v02"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v02"
+TITLE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.activewindowtitle"
+TITLE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle"
+TARGET_WIDGETS=(
+    org.kde.plasma.kickoff
+    org.kde.minimalist.activewindowtitle
+    org.kde.plasma.panelspacer
+    org.kde.plasma.marginsseparator
+    org.kde.plasma.kimpanel
+    org.kde.plasma.systemtray
+    org.kde.plasma.digitalclock
+)
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-fresh [OPTIONS]
+
+Preview or replace a narrowly recognized fresh Plasma 6 stock panel with the
+Minimalist v0.2 target. Preview is the default.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot, install packages, and apply the live layout
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded Plasma 6 apply
+  -h, --help            Show this help
+
+Accepted fresh signatures (exact AppletOrder):
+  plasma6-stock
+    kickoff | pager | icon tasks | margin separator | tray | clock | show desktop
+  plasma6-stock-ime
+    kickoff | pager | icon tasks | margin separator | kimpanel | tray | clock |
+    show desktop
+
+Both require exactly one horizontal bottom panel on screen 0. The exact
+Minimalist v0.2 target is also accepted for idempotent reapplication. Existing
+v0.1/v0.2 transition states belong to scripts/apply-minimalist-v02. Every other
+topology is refused before snapshot or mutation.
+EOF
+}
+
+usage_error() {
+    printf 'error: %s\n' "$*" >&2
+    printf 'Try scripts/apply-fresh --help for usage.\n' >&2
+    exit 64
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || usage_error "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage_error "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+require_command cp
+require_command date
+require_command mv
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal fresh-install overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+set +e
+doctor_output=$("$DOCTOR_COMMAND" 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; fresh apply is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+QDBUS=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+load_managed_paths "$MANIFEST"
+
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+
+layout_source_path="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+title_source_path="$REPO_ROOT/$TITLE_SOURCE_RELATIVE"
+title_destination="$TARGET_HOME/$TITLE_TARGET_RELATIVE"
+
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$TITLE_TARGET_RELATIVE"; do
+    validate_relative_path "$target_relative" || die "unsafe fresh-install target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] || die "fresh-install target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+[[ -d $layout_source_path && ! -L $layout_source_path ]] || die "Minimalist v0.2 layout source is missing or unsafe"
+[[ -d $title_source_path && ! -L $title_source_path ]] || die "active-title source is missing or unsafe"
+[[ -f $layout_source_path/metadata.json
+    && -f $layout_source_path/contents/panel-state.js
+    && -f $layout_source_path/contents/fresh-layout.js
+    && -f $layout_source_path/contents/postcheck.js ]] || die "fresh-install layout package is incomplete"
+[[ -f $title_source_path/metadata.json
+    && -f $title_source_path/contents/ui/main.qml ]] || die "active-title package is incomplete"
+
+evaluate_plasma_script() {
+    "$QDBUS" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+field_from_marker() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+printf 'Fresh-install mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\nInspecting the live panel without changing it...\n'
+probe_output=$(evaluate_plasma_script "$(< "$layout_source_path/contents/panel-state.js")")
+probe_output=$(normalize_plasma_probe_output "$probe_output")
+printf '%s\n' "$probe_output"
+probe_marker=$(printf '%s\n' "$probe_output" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q;}')
+[[ -n $probe_marker ]] || die "panel-state probe did not return its stable marker"
+
+signature=$(field_from_marker "$probe_marker" signature) || die "panel-state marker omitted signature"
+transition=$(field_from_marker "$probe_marker" transition) || die "panel-state marker omitted transition"
+remove_panel_ids=$(field_from_marker "$probe_marker" removePanelIds) || die "panel-state marker omitted panel removals"
+remove_widget_ids=$(field_from_marker "$probe_marker" removeWidgetIds) || die "panel-state marker omitted widget removals"
+remove_widget_entries=$(field_from_marker "$probe_marker" removeWidgetEntries) || die "panel-state marker omitted widget removal details"
+target_widgets=$(field_from_marker "$probe_marker" targetWidgets) || die "panel-state marker omitted target widgets"
+
+case "$signature" in
+    plasma6-stock | plasma6-stock-ime)
+        [[ $transition == replace-fresh-panel ]] || die "inconsistent fresh-panel transition from probe"
+        ;;
+    minimalist-v02)
+        [[ $transition == already-target ]] || die "inconsistent target transition from probe"
+        ;;
+    minimalist-v01 | minimalist-v02-show-desktop | minimalist-v02-no-title | minimalist-v02-spacer-repair | minimalist-v02-title-repair)
+        die "managed panel state '$signature' must use scripts/apply-minimalist-v02, not scripts/apply-fresh"
+        ;;
+    *)
+        die "fresh apply refuses unknown panel topology"
+        ;;
+esac
+
+expected_target=$(IFS=,; printf '%s' "${TARGET_WIDGETS[*]}")
+[[ $target_widgets == "$expected_target" ]] || die "probe target differs from the repository target"
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-fresh-minimalist-v02-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+snapshot_prepared=false
+if $APPLY && [[ -n ${KDE_RICE_TRANSACTION_SNAPSHOT:-} \
+    || -n ${KDE_RICE_TRANSACTION_RECEIPT:-} ]]; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+    snapshot_prepared=true
+fi
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\nFresh-install plan\n'
+printf '  recognized signature: %s\n' "$signature"
+printf '  transition: %s\n' "$transition"
+printf '  install: %s -> %s\n' "$TITLE_SOURCE_RELATIVE" "$TITLE_TARGET_RELATIVE"
+printf '  install: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+if [[ $transition == replace-fresh-panel ]]; then
+    IFS=',' read -r -a panel_ids <<< "$remove_panel_ids"
+    IFS=',' read -r -a widget_ids <<< "$remove_widget_ids"
+    IFS=',' read -r -a widget_entries <<< "$remove_widget_entries"
+    for panel_id in "${panel_ids[@]}"; do
+        printf '  remove panel id: %s\n' "$panel_id"
+    done
+    for index in "${!widget_ids[@]}"; do
+        printf '  remove widget: %s\n' "${widget_entries[$index]:-${widget_ids[$index]}}"
+    done
+    printf '  create panel: screen=0 location=top form=horizontal height=32 length=fill floating=false opacity=opaque\n'
+else
+    printf '  preserve target panel id and reassert its managed policy\n'
+fi
+for index in "${!TARGET_WIDGETS[@]}"; do
+    printf '  target widget %d: %s\n' "$((index + 1))" "${TARGET_WIDGETS[$index]}"
+done
+printf '  clock policy: date hidden; 24-hour time with seconds; automatic system font sizing\n'
+printf '  preserve: display resolution, scale, HDR, VRR, refresh rate, KWin shortcuts, and unrelated user data\n'
+printf '  planned snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, package, panel, widget, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\nCapturing all managed paths before the first managed write...\n'
+if ! $snapshot_prepared; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+else
+    printf 'Bootstrap baseline was already validated before this component plan.\n'
+fi
+
+apply_error() {
+    local status=$?
+    warn "fresh-install apply stopped after an error; Plasma and KWin were not restarted"
+    warn "snapshot: $snapshot_path"
+    warn "restore preview: $restore_preview"
+    warn "restore apply: $restore_apply"
+    exit "$status"
+}
+trap apply_error ERR
+
+umask 077
+install_package() {
+    local source_path=$1
+    local destination=$2
+    local target_relative=$3
+    local temporary="$destination.kde-rice-new-$$"
+    local current
+
+    current=$(path_type "$destination")
+    [[ $current != unsupported ]] || die "managed target has an unsupported type: $target_relative"
+    [[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source_path" "$temporary"
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced_path/$(dirname -- "$target_relative")"
+        mv -- "$destination" "$displaced_path/$target_relative"
+    fi
+    mv -- "$temporary" "$destination"
+}
+
+install_package "$title_source_path" "$title_destination" "$TITLE_TARGET_RELATIVE"
+install_package "$layout_source_path" "$layout_destination" "$LAYOUT_TARGET_RELATIVE"
+
+printf '\nRevalidating and applying the fresh transition inside Plasma...\n'
+apply_output=$(evaluate_plasma_script "$(< "$layout_destination/contents/fresh-layout.js")")
+printf '%s\n' "$apply_output"
+[[ $apply_output == *MINIMALIST_V02_FRESH_APPLY_OK* ]] || die "Plasma did not confirm the fresh Minimalist v0.2 transition"
+
+post_output=""
+for attempt in {1..10}; do
+    post_output=$(evaluate_plasma_script "$(< "$layout_destination/contents/postcheck.js")")
+    [[ $post_output == *MINIMALIST_V02_POSTCHECK_OK* ]] && break
+    ((attempt == 10)) || sleep 0.1
+done
+printf '%s\n' "$post_output"
+if [[ $post_output != *MINIMALIST_V02_POSTCHECK_OK* ]]; then
+    if [[ $post_output == *geometryBaseOk=true* \
+        && $post_output == *opacityOk=false* \
+        && $post_output == *topologyOk=true* \
+        && $post_output == *spacerOk=true* \
+        && $post_output == *activeTitleOk=true* \
+        && $post_output == *trayOk=true* \
+        && $post_output == *clockOk=true* ]]; then
+        die "fresh panel is otherwise complete, but Plasma did not apply Opaque; change only this panel to Opaque in edit mode, then use the exact failed-receipt resume commands printed by bootstrap instead of starting a new live bootstrap"
+    fi
+    die "live fresh-install target did not pass the Minimalist v0.2 postcheck"
+fi
+
+trap - ERR
+printf '\nFresh-install apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced managed packages: %s\n' "$displaced_path"
+fi
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+printf 'Plasma and KWin were not restarted. Display configuration was untouched.\n'

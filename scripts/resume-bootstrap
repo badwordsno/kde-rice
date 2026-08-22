@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/display-state.sh
+source "$SCRIPT_DIR/lib/display-state.sh"
+
+TARGET_HOME=${HOME:-}
+RECEIPT=
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+STEP_RUNNER=${KDE_RICE_STEP_RUNNER:-}
+PANEL_PROBE="$SCRIPT_DIR/../layouts/plasma/org.kde.minimalist-v02/contents/panel-state.js"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/resume-bootstrap --receipt ABSOLUTE_PATH [OPTIONS]
+
+Resume a documented manually repaired bootstrap transaction. Dry-run is the
+default. An opacity failure after the fresh base panel continues only the
+missing v0.3/v0.4.1 components against the original transaction snapshot;
+an already-complete target changes transaction metadata only.
+
+Options:
+  --receipt PATH        Failed bootstrap receipt to resume (required)
+  --home ABSOLUTE_PATH  Target home (default: $HOME; must be current user)
+  --apply               Preserve failure history and finalize the receipt
+  --dry-run             Explicitly select read-only verification (default)
+  --allow-degraded      Permit an explicitly reviewed degraded diagnosis
+  -h, --help            Show this help
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --receipt)
+            (($# >= 2)) || die "--receipt requires a path"
+            RECEIPT=$2
+            shift 2
+            ;;
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+[[ -n $RECEIPT ]] || die "--receipt is required"
+for command_name in realpath date mv mkdir ln; do
+    require_command "$command_name"
+done
+refuse_root
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_STEP_RUNNER || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal resume overrides are available only in isolated test mode"
+fi
+if [[ -n $STEP_RUNNER ]]; then
+    require_current_desktop_home "$TARGET_HOME" bootstrap-mock
+    [[ -x $STEP_RUNNER ]] || die "configured resume step runner is not executable"
+else
+    require_current_desktop_home "$TARGET_HOME" dbus-mock
+fi
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+
+[[ $RECEIPT == /* && -d $RECEIPT && ! -L $RECEIPT ]] \
+    || die "receipt must be an existing non-symlinked absolute directory"
+RECEIPT=$(realpath -e -- "$RECEIPT") || die "cannot resolve receipt"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/bootstrap/receipt-check"
+receipt_root=$(realpath -m -- "$TARGET_HOME/.local/state/kde-rice/bootstrap") \
+    || die "cannot resolve bootstrap receipt root"
+case "$RECEIPT" in
+    "$receipt_root"/*) ;;
+    *) die "receipt is outside the current home bootstrap state root" ;;
+esac
+[[ -f $RECEIPT/failed && ! -L $RECEIPT/failed ]] \
+    || die "receipt is not a failed bootstrap transaction"
+[[ ! -e $RECEIPT/complete && ! -L $RECEIPT/complete ]] \
+    || die "a completed bootstrap receipt cannot be resumed"
+for required_file in snapshot-path display-state.before.tsv compatibility panel-signature.before; do
+    [[ -f $RECEIPT/$required_file && ! -L $RECEIPT/$required_file ]] \
+        || die "failed receipt is missing safe metadata: $required_file"
+done
+
+IFS=$'\t' read -r failed_step failed_status failed_extra < "$RECEIPT/failed"
+[[ -n $failed_step && $failed_status =~ ^[0-9]+$ && -z ${failed_extra:-} ]] \
+    || die "failed receipt status is malformed"
+receipt_compatibility=$(< "$RECEIPT/compatibility")
+receipt_panel_before=$(< "$RECEIPT/panel-signature.before")
+
+legacy_panel_target=false
+if [[ -e $RECEIPT/panel-target || -L $RECEIPT/panel-target ]]; then
+    [[ -f $RECEIPT/panel-target && ! -L $RECEIPT/panel-target \
+        && -r $RECEIPT/panel-target ]] \
+        || die "failed receipt panel target is unsafe"
+    panel_target=$(< "$RECEIPT/panel-target")
+else
+    # Receipts created before the v0.4.1 transaction metadata existed could only
+    # target the then-current v0.3 desktop.
+    panel_target=minimalist-v03
+    legacy_panel_target=true
+fi
+case "$panel_target" in
+    minimalist-v03 | minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces) ;;
+    *) die "failed receipt names an unsupported panel target: $panel_target" ;;
+esac
+doctor_target=$panel_target
+case "$panel_target" in
+    minimalist-v04-pager | minimalist-v04-workspaces) doctor_target=minimalist-v04 ;;
+esac
+
+snapshot_path=$(< "$RECEIPT/snapshot-path")
+[[ $snapshot_path == /* && -d $snapshot_path && ! -L $snapshot_path \
+    && -f $snapshot_path/complete && ! -L $snapshot_path/complete ]] \
+    || die "failed receipt does not name a complete safe baseline snapshot"
+snapshot_path=$(realpath -e -- "$snapshot_path") || die "cannot resolve baseline snapshot"
+snapshot_root=$(realpath -m -- "$TARGET_HOME/.local/state/kde-rice/snapshots") \
+    || die "cannot resolve snapshot root"
+case "$snapshot_path" in
+    "$snapshot_root"/*) ;;
+    *) die "baseline snapshot is outside the current home state root" ;;
+esac
+
+printf '1. Environment diagnosis (read-only)\n'
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target "$doctor_target" 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) compatibility=supported ;;
+    1)
+        compatibility=degraded
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if acceptable"
+        fi
+        ;;
+    2) die "doctor reported unsupported; failed bootstrap cannot be resumed" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+marker_field() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*) printf '%s\n' "${token#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+resume_mode=metadata-only
+if [[ $failed_step == panel ]]; then
+    [[ -f $PANEL_PROBE ]] || die "panel-state probe is unavailable"
+    DBUS_TOOL=$(resolve_dbus_tool) || die "compatible Plasma D-Bus tool is unavailable"
+    set +e
+    panel_output=$($DBUS_TOOL org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$(< "$PANEL_PROBE")" 2>&1)
+    panel_status=$?
+    set -e
+    ((panel_status == 0)) || die "running plasmashell could not be inspected for receipt resume"
+    panel_output=$(normalize_plasma_probe_output "$panel_output")
+    panel_marker=$(printf '%s\n' "$panel_output" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q;}')
+    [[ -n $panel_marker ]] || die "panel-state probe returned no stable resume summary"
+    current_signature=$(marker_field "$panel_marker" signature) \
+        || die "panel-state resume summary omitted signature"
+    current_transition=$(marker_field "$panel_marker" transition) \
+        || die "panel-state resume summary omitted transition"
+    current_geometry_ok=$(marker_field "$panel_marker" geometryOk) \
+        || die "panel-state resume summary omitted geometry policy"
+    current_geometry=$(marker_field "$panel_marker" geometry) \
+        || die "panel-state resume summary omitted geometry"
+
+    if [[ $panel_target == minimalist-v04 \
+        && $receipt_compatibility == degraded \
+        && ( $receipt_panel_before == plasma6-stock || $receipt_panel_before == plasma6-stock-ime ) \
+        && $current_signature == minimalist-v02 \
+        && $current_transition == already-target \
+        && $current_geometry_ok == true \
+        && ( $current_geometry == 0,top,horizontal,28,opaque,fill,* \
+            || $current_geometry == 0,top,horizontal,32,opaque,fill,* ) ]]; then
+        [[ $compatibility == supported ]] \
+            || die "fresh-opacity continuation requires a fully supported diagnosis after the manual Opaque repair"
+        resume_mode=component-continuation
+    elif [[ $current_signature != "$panel_target" ]]; then
+        die "failed panel receipt is neither the exact repaired final target nor the documented Opaque-repaired fresh base"
+    fi
+fi
+
+printf '\n2. Repaired target and display-baseline verification (read-only)\n'
+if [[ $resume_mode == metadata-only ]]; then
+    "$VERIFY_COMMAND" --home "$TARGET_HOME" --resume-receipt "$RECEIPT" \
+        --panel-target "$panel_target"
+else
+    printf '  documented continuation source: minimalist-v02\n'
+    printf '  panel geometry: %s\n' "$current_geometry"
+    printf '  original stock-panel failure: %s (status %s)\n' "$failed_step" "$failed_status"
+    printf '  final v0.4.1 verification is deferred until the missing v0.3/v0.4.1 steps run\n'
+fi
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+history_path="$RECEIPT/history/$timestamp-resume-$$"
+latest_link="$receipt_root/latest"
+temporary_link="$latest_link.kde-rice-new-$$"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+
+printf '\n3. Complete resume plan\n'
+printf '  compatibility: %s\n' "$compatibility"
+if $legacy_panel_target; then
+    printf '  receipt panel target: %s (safe legacy default for pre-v0.4.1 receipts)\n' "$panel_target"
+else
+    printf '  receipt panel target: %s\n' "$panel_target"
+fi
+if [[ $resume_mode == component-continuation ]]; then
+    printf '  resume mode: receipt-bound component continuation\n'
+    printf '  baseline reuse: the original complete transaction snapshot; no nested snapshot\n'
+    printf '  managed asset writes: exact v0.3 resource Plasmoid/layout and exact v0.4.1 layout\n'
+    printf '  managed Plasma config that may change: .config/plasma-org.kde.plasma.desktop-appletsrc\n'
+    printf '  panel removals: none\n'
+    printf '  panel additions: one resource widget, one right expanding spacer, one Icons-only Task Manager\n'
+    printf '  final widget order: launcher | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+    printf '  clock policy: date hidden; 24-hour time with seconds; fixed Noto Sans 11 pt\n'
+else
+    printf '  resume mode: metadata-only finalization\n'
+    printf '  managed desktop writes: none\n'
+    printf '  panel/widget removals or additions: none\n'
+fi
+printf '  preserve failed status and any prior verification metadata: %s\n' "$history_path"
+printf '  record current excluded-display fingerprint as after-state\n'
+printf '  run the normal read-only scripts/verify receipt path\n'
+printf '  mark this receipt complete and atomically select it as latest only on success\n'
+printf '  baseline snapshot: %s\n' "$snapshot_path"
+printf '  rollback preview: %s\n' "$restore_preview"
+printf '  rollback apply: %s\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no receipt, managed target, panel, widget, or display setting was written.\n'
+    exit 0
+fi
+
+[[ ! -e $temporary_link && ! -L $temporary_link ]] \
+    || die "temporary latest pointer already exists: $temporary_link"
+[[ ! -e $history_path && ! -L $history_path ]] \
+    || die "resume history path already exists: $history_path"
+[[ ! -e $latest_link || -L $latest_link ]] \
+    || die "bootstrap latest pointer exists but is not a symlink"
+for optional_file in display-state.failure.tsv display-state.after.tsv verification-ready; do
+    [[ ! -e $RECEIPT/$optional_file && ! -L $RECEIPT/$optional_file \
+        || -f $RECEIPT/$optional_file && ! -L $RECEIPT/$optional_file ]] \
+        || die "receipt contains unsafe resumable metadata: $optional_file"
+done
+
+display_before=$(< "$RECEIPT/display-state.before.tsv")
+display_after=$(display_state_lines "$TARGET_HOME") \
+    || die "excluded display paths could not be fingerprinted safely"
+[[ $display_before == "$display_after" ]] \
+    || die "excluded display configuration differs from the failed transaction baseline"
+
+current_step=resume-initialization
+resume_failure() {
+    local status=$?
+    trap - ERR
+    printf '%s\t%s\n' "$current_step" "$status" > "$RECEIPT/failed" 2>/dev/null || true
+    display_state_lines "$TARGET_HOME" > "$RECEIPT/display-state.failure.tsv" 2>/dev/null || true
+    printf 'error: receipt resume failed during %s; the receipt remains failed\n' "$current_step" >&2
+    printf 'failure history: %s\n' "$history_path" >&2
+    printf 'baseline snapshot: %s\n' "$snapshot_path" >&2
+    printf 'rollback preview: %s\n' "$restore_preview" >&2
+    printf 'rollback apply: %s\n' "$restore_apply" >&2
+    exit "$status"
+}
+trap resume_failure ERR
+
+umask 077
+mkdir -p -- "$history_path"
+for status_file in failed display-state.failure.tsv display-state.after.tsv verification-ready; do
+    if [[ -f $RECEIPT/$status_file && ! -L $RECEIPT/$status_file ]]; then
+        mv -- "$RECEIPT/$status_file" "$history_path/$status_file"
+    fi
+done
+printf '%s\n' "$display_after" > "$RECEIPT/display-state.after.tsv"
+printf 'ready\n' > "$RECEIPT/verification-ready"
+export KDE_RICE_TRANSACTION_RECEIPT="$RECEIPT"
+export KDE_RICE_TRANSACTION_SNAPSHOT="$snapshot_path"
+
+run_component() {
+    if [[ -n $STEP_RUNNER ]]; then
+        "$STEP_RUNNER" "$@"
+    else
+        "$@"
+    fi
+}
+
+if [[ $resume_mode == component-continuation ]]; then
+    printf '\n4. Apply receipt-bound missing components\n'
+    current_step=resume-resource-strip
+    run_component "$SCRIPT_DIR/apply-minimalist-v03" --home "$TARGET_HOME" --apply \
+        || resume_failure
+    current_step=resume-task-manager
+    run_component "$SCRIPT_DIR/apply-minimalist-v04" --home "$TARGET_HOME" --apply \
+        || resume_failure
+    current_step=resume-display-preservation
+    display_after=$(display_state_lines "$TARGET_HOME") \
+        || resume_failure
+    printf '%s\n' "$display_after" > "$RECEIPT/display-state.after.tsv"
+    [[ $display_before == "$display_after" ]] \
+        || { false; resume_failure; }
+fi
+
+printf '\n5. Final read-only verification\n'
+current_step=resume-verify
+"$VERIFY_COMMAND" --home "$TARGET_HOME" --receipt "$RECEIPT" \
+    --panel-target "$panel_target"
+
+current_step=resume-finalization
+printf 'complete\n' > "$RECEIPT/complete"
+ln -s -- "$RECEIPT" "$temporary_link"
+mv -Tf -- "$temporary_link" "$latest_link"
+trap - ERR
+
+printf '\nBootstrap receipt resumed and mechanically verified.\n'
+printf 'Transaction receipt: %s\n' "$RECEIPT"
+printf 'Failure history: %s\n' "$history_path"
+printf 'Baseline snapshot: %s\n' "$snapshot_path"
+if [[ $resume_mode == component-continuation ]]; then
+    printf 'The missing v0.3/v0.4.1 managed components were applied against the original baseline snapshot.\n'
+else
+    printf 'No managed desktop, panel, widget, KWin, or display setting was written.\n'
+fi

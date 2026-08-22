@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "kde-rice"
+            }
+        ],
+        "Category": "Windows and Tasks",
+        "Description": "Switch virtual desktops with compact numbered buttons",
+        "EnabledByDefault": true,
+        "Icon": "preferences-desktop-virtual",
+        "Id": "org.kde.minimalist.workspaces",
+        "License": "MIT",
+        "Name": "Minimalist Workspaces",
+        "Version": "1.3"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

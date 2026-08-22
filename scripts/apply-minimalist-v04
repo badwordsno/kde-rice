@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+ACTIVE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.activewindowtitle"
+ACTIVE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle"
+RESOURCE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.resources"
+RESOURCE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.resources"
+WORKSPACE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.workspaces"
+WORKSPACE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.workspaces"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-minimalist-v04 [OPTIONS]
+
+Preview or apply the Minimalist v0.4.1 centered task strip. Preview is the
+default. The guarded migration adds one right flexible spacer and one native
+Icons-only Task Manager to the exact Minimalist v0.3 panel.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot, install, and activate the centered task strip
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded apply
+  -h, --help            Show this help
+
+Accepted live states are exact Minimalist v0.3, the exact staged two-spacer or
+task-front recovery transitions, and the exact base, Pager, or Workspaces
+v0.4.1 target. Every other topology is refused before snapshot or mutation.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+for command_name in realpath cp date mv mkdir; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal v0.4.1 overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; Minimalist v0.4.1 apply is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+load_managed_paths "$MANIFEST"
+
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+
+layout_source="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+active_source="$REPO_ROOT/$ACTIVE_SOURCE_RELATIVE"
+active_destination="$TARGET_HOME/$ACTIVE_TARGET_RELATIVE"
+resource_source="$REPO_ROOT/$RESOURCE_SOURCE_RELATIVE"
+resource_destination="$TARGET_HOME/$RESOURCE_TARGET_RELATIVE"
+workspace_source="$REPO_ROOT/$WORKSPACE_SOURCE_RELATIVE"
+workspace_destination="$TARGET_HOME/$WORKSPACE_TARGET_RELATIVE"
+
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$ACTIVE_TARGET_RELATIVE" \
+    "$RESOURCE_TARGET_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"; do
+    validate_relative_path "$target_relative" || die "unsafe v0.4.1 target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] || die "v0.4.1 target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+[[ -d $layout_source && ! -L $layout_source ]] || die "v0.4.1 layout source is missing or unsafe"
+[[ -d $active_source && ! -L $active_source ]] || die "active-title Plasmoid source is missing or unsafe"
+[[ -d $resource_source && ! -L $resource_source ]] || die "resource Plasmoid source is missing or unsafe"
+[[ -d $workspace_source && ! -L $workspace_source ]] || die "Workspaces Plasmoid source is missing or unsafe"
+[[ -f $layout_source/metadata.json
+    && -f $layout_source/contents/preflight.js
+    && -f $layout_source/contents/stage-spacer.js
+    && -f $layout_source/contents/layout.js
+    && -f $layout_source/contents/cleanup.js
+    && -f $layout_source/contents/postcheck.js ]] || die "v0.4.1 layout package is incomplete"
+[[ -f $resource_source/metadata.json
+    && -f $resource_source/contents/ui/main.qml ]] || die "resource Plasmoid package is incomplete"
+for package_source in "$active_source" "$workspace_source"; do
+    [[ -f $package_source/metadata.json && -f $package_source/contents/ui/main.qml ]] \
+        || die "project Plasmoid package is incomplete: $package_source"
+done
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+printf 'Minimalist v0.4.1 mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\n1. Current topology (read-only)\n'
+preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/preflight.js")")
+printf '%s\n' "$preflight"
+[[ $preflight == *MINIMALIST_V04_PREFLIGHT_OK* ]] \
+    || die "live panel differs from the exact Minimalist v0.3/staged/v0.4.1 states"
+case "$preflight" in
+    *topology=minimalist-v04-spacer-staged*) current_topology=minimalist-v04-spacer-staged ;;
+    *topology=minimalist-v04-task-front-staged*) current_topology=minimalist-v04-task-front-staged ;;
+    *topology=minimalist-v04-workspaces*) current_topology=minimalist-v04-workspaces ;;
+    *topology=minimalist-v04-pager*) current_topology=minimalist-v04-pager ;;
+    *topology=minimalist-v04*) current_topology=minimalist-v04 ;;
+    *topology=minimalist-v03*) current_topology=minimalist-v03 ;;
+    *) die "v0.4.1 preflight omitted its accepted topology" ;;
+esac
+case "$current_topology" in
+    minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces)
+        final_topology=true
+        ;;
+    *) final_topology=false ;;
+esac
+case "$preflight" in
+    *" height=28 "*) current_height=28 ;;
+    *" height=32 "*) current_height=32 ;;
+    *) die "v0.4.1 preflight omitted its accepted panel height" ;;
+esac
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-minimalist-v04-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+snapshot_prepared=false
+if $APPLY && [[ -n ${KDE_RICE_TRANSACTION_SNAPSHOT:-} \
+    || -n ${KDE_RICE_TRANSACTION_RECEIPT:-} ]]; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+    snapshot_prepared=true
+fi
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\n2. Complete change plan\n'
+printf '  current accepted topology: %s on one screen-0 top panel\n' "$current_topology"
+printf '  managed asset write: %s -> %s\n' "$ACTIVE_SOURCE_RELATIVE" "$ACTIVE_TARGET_RELATIVE"
+printf '  managed asset write: %s -> %s\n' "$RESOURCE_SOURCE_RELATIVE" "$RESOURCE_TARGET_RELATIVE"
+printf '  managed asset write: %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
+printf '  managed asset write: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed Plasma config that may change: .config/plasma-org.kde.plasma.desktop-appletsrc\n'
+printf '  panel removals: none\n'
+printf '  panel height: %s -> 32 logical px; preserve the existing panel instance\n' "$current_height"
+case "$current_topology" in
+    minimalist-v03)
+        printf '  panel additions: one right %s and one %s\n' \
+            'org.kde.plasma.panelspacer' 'org.kde.plasma.icontasks'
+        ;;
+    minimalist-v04-spacer-staged)
+        printf '  panel additions: one %s; preserve both existing spacers\n' \
+            'org.kde.plasma.icontasks'
+        ;;
+    minimalist-v04-task-front-staged)
+        printf '  recovery removals: the misplaced v0.4.1 task and right spacer; then rebuild both in two settled phases\n'
+        ;;
+    minimalist-v04)
+        printf '  panel additions: none; preserve the existing task and spacer instances\n'
+        ;;
+    minimalist-v04-pager | minimalist-v04-workspaces)
+        printf '  panel additions: none; preserve the existing optional switcher, task, and spacer instances\n'
+        ;;
+esac
+case "$current_topology" in
+    minimalist-v04-pager)
+        printf '  target order: launcher | Pager | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+    minimalist-v04-workspaces)
+        printf '  target order: launcher | Workspaces | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+    *)
+        printf '  target order: launcher | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+esac
+printf '  clock policy: date hidden; 24-hour time with seconds; fixed Noto Sans 11 pt\n'
+printf '  spacer policy: both flexible spacers use General expanding=true\n'
+printf '  task presentation policy: General fill=false, maxStripes=1, iconSpacing=0\n'
+printf '  application targets: user-owned; no pinned application list is inspected, seeded, rewritten, or verified\n'
+printf '  preserve: panel geometry other than height, all unrelated widget settings, wallpaper, KWin, shortcuts, and display configuration\n'
+printf '  snapshot before first write: %s\n' "$snapshot_path"
+printf '  rollback preview: %s\n' "$restore_preview"
+printf '  rollback apply: %s\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, package, widget, panel, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n3. Capturing the complete managed scope before the first write\n'
+if ! $snapshot_prepared; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+else
+    printf 'Bootstrap baseline was already validated before this component plan.\n'
+fi
+
+apply_error() {
+    local status=$?
+    local cleanup_result cleanup_status=0 restore_status=0
+    trap - EXIT
+    set +e
+    warn "Minimalist v0.4.1 apply stopped after an error; Plasma and KWin were not restarted"
+    warn "snapshot: $snapshot_path"
+    if ! $final_topology; then
+        cleanup_result=$(evaluate_plasma_script "$(< "$layout_source/contents/cleanup.js")" 2>&1)
+        cleanup_status=$?
+        printf '%s\n' "$cleanup_result" >&2
+        if ((cleanup_status != 0)) || [[ $cleanup_result != *MINIMALIST_V04_CLEANUP_OK* ]]; then
+            warn "exact live v0.4.1 cleanup did not complete; a logout may be required after restore"
+        fi
+    fi
+    "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
+    restore_status=$?
+    if ((restore_status != 0)); then
+        warn "automatic snapshot restore failed"
+        warn "restore apply: $restore_apply"
+    else
+        warn "pre-apply snapshot restored automatically"
+    fi
+    exit "$status"
+}
+trap apply_error EXIT
+
+umask 077
+install_package() {
+    local source_path=$1
+    local destination=$2
+    local target_relative=$3
+    local temporary="$destination.kde-rice-new-$$"
+    local current
+
+    current=$(path_type "$destination")
+    [[ $current != unsupported ]] || die "managed target has an unsupported type: $target_relative"
+    [[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source_path" "$temporary"
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced_path/$(dirname -- "$target_relative")"
+        mv -- "$destination" "$displaced_path/$target_relative"
+    fi
+    mv -- "$temporary" "$destination"
+}
+
+printf '\n4. Installing exact project packages\n'
+install_package "$active_source" "$active_destination" "$ACTIVE_TARGET_RELATIVE"
+install_package "$resource_source" "$resource_destination" "$RESOURCE_TARGET_RELATIVE"
+install_package "$workspace_source" "$workspace_destination" "$WORKSPACE_TARGET_RELATIVE"
+install_package "$layout_source" "$layout_destination" "$LAYOUT_TARGET_RELATIVE"
+
+if [[ $current_topology == minimalist-v04-task-front-staged ]]; then
+    printf '\n5. Removing the exact misplaced v0.4.1 additions before retry\n'
+    cleanup_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/cleanup.js")")
+    printf '%s\n' "$cleanup_result"
+    [[ $cleanup_result == *MINIMALIST_V04_CLEANUP_OK* ]] \
+        || die "Plasma did not confirm exact task-front cleanup"
+    cleanup_preflight=
+    for attempt in {1..30}; do
+        cleanup_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/preflight.js")")
+        [[ $cleanup_preflight == *topology=minimalist-v03* ]] && break
+        ((attempt == 30)) || sleep 0.1
+    done
+    printf '%s\n' "$cleanup_preflight"
+    [[ $cleanup_preflight == *topology=minimalist-v03* ]] \
+        || die "the exact task-front cleanup did not settle back to v0.3"
+    current_topology=minimalist-v03
+    final_topology=false
+fi
+
+if [[ $current_topology == minimalist-v03 ]]; then
+    printf '\n5. Staging the second spacer without a task manager\n'
+    stage_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/stage-spacer.js")")
+    printf '%s\n' "$stage_result"
+    [[ $stage_result == *MINIMALIST_V04_STAGE_SPACER_OK* ]] \
+        || die "Plasma did not confirm the isolated v0.4.1 spacer stage"
+fi
+
+if ! $final_topology; then
+    printf '\n6. Waiting for the staged spacer to settle in the live layout\n'
+    stage_preflight=
+    for attempt in {1..30}; do
+        stage_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/preflight.js")")
+        if [[ $stage_preflight == *topology=minimalist-v04-spacer-staged* \
+            && $stage_preflight == *stageAnchorReady=true* ]]; then
+            break
+        fi
+        ((attempt == 30)) || sleep 0.1
+    done
+    printf '%s\n' "$stage_preflight"
+    [[ $stage_preflight == *topology=minimalist-v04-spacer-staged* \
+        && $stage_preflight == *stageAnchorReady=true* ]] \
+        || die "the isolated v0.4.1 spacer did not reach a settled exact stage"
+fi
+
+printf '\n7. Adding or reconfiguring the centered task strip\n'
+result=$(evaluate_plasma_script "$(< "$layout_destination/contents/layout.js")")
+printf '%s\n' "$result"
+[[ $result == *MINIMALIST_V04_CENTER_TASKS_OK* ]] \
+    || die "Plasma did not confirm the Minimalist v0.4.1 transition"
+
+printf '\n8. Read-only post-apply verification\n'
+post_result=
+for attempt in {1..30}; do
+    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/postcheck.js")")
+    [[ $post_result == *MINIMALIST_V04_POSTCHECK_OK* ]] && break
+    ((attempt == 30)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_V04_POSTCHECK_OK* ]] \
+    || die "live v0.4.1 topology or managed widget policy did not match the target"
+
+trap - EXIT
+printf '\nMinimalist v0.4.1 centered task strip apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced managed packages: %s\n' "$displaced_path"
+fi
+printf 'No panel or existing widget instance was removed. Plasma, KWin, shortcuts, and display settings were untouched.\n'

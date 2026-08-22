@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+OUTPUT=
+DRY_RUN=false
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/snapshot [OPTIONS]
+
+Create a private, timestamped snapshot of the exact KDE paths managed by this
+project.
+
+Options:
+  --home ABSOLUTE_PATH    Target home directory (default: $HOME)
+  --output ABSOLUTE_PATH  Exact snapshot directory
+  --dry-run               Print the capture plan without writing anything
+  -h, --help              Show this help
+
+Default output:
+  $XDG_STATE_HOME/kde-rice/snapshots/<UTC timestamp>
+  or $HOME/.local/state/kde-rice/snapshots/<UTC timestamp>
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --output)
+            (($# >= 2)) || die "--output requires a path"
+            OUTPUT=$2
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+require_command cp
+require_command date
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+load_managed_paths "$MANIFEST"
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+if [[ -z $OUTPUT ]]; then
+    state_root=${XDG_STATE_HOME:-$TARGET_HOME/.local/state}
+    OUTPUT="$state_root/kde-rice/snapshots/$timestamp"
+fi
+OUTPUT=$(normalize_output_path "$OUTPUT")
+
+[[ ! -e $OUTPUT && ! -L $OUTPUT ]] || die "snapshot output already exists: $OUTPUT"
+
+printf 'Snapshot target: %s\n' "$OUTPUT"
+printf 'Source home: %s\n\n' "$TARGET_HOME"
+print_managed_paths "$TARGET_HOME"
+
+if $DRY_RUN; then
+    printf '\nDry run only; no snapshot was written.\n'
+    exit 0
+fi
+
+umask 077
+mkdir -p -- "$OUTPUT/payload"
+printf '%s\n' "$KDE_RICE_FORMAT_VERSION" > "$OUTPUT/format-version"
+printf '%s\n' "$timestamp" > "$OUTPUT/created-at"
+printf '%s\n' "$TARGET_HOME" > "$OUTPUT/source-home"
+cp -- "$MANIFEST" "$OUTPUT/managed-paths.txt"
+: > "$OUTPUT/state.tsv"
+
+for relative in "${MANAGED_PATHS[@]}"; do
+    source_path="$TARGET_HOME/$relative"
+    type=$(path_type "$source_path")
+    [[ $type != unsupported ]] || die "managed path has an unsupported file type: $relative"
+
+    printf '%s\t%s\n' "$type" "$relative" >> "$OUTPUT/state.tsv"
+    if [[ $type != absent ]]; then
+        mkdir -p -- "$OUTPUT/payload/$(dirname -- "$relative")"
+        cp -a -- "$source_path" "$OUTPUT/payload/$relative"
+    fi
+done
+
+printf 'complete\n' > "$OUTPUT/complete"
+printf '\nSnapshot complete: %s\n' "$OUTPUT"

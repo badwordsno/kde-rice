@@ -1,0 +1,10 @@
+{
+    "KPackageStructure": "Plasma/LayoutTemplate",
+    "KPlugin": {
+        "Description": "Center a compact native Icons-only Task Manager in the Minimalist status strip",
+        "Id": "org.kde.minimalist-v04",
+        "License": "MIT",
+        "Name": "Minimalist v0.4.1 Center Task Strip",
+        "Version": "0.4.1"
+    }
+}

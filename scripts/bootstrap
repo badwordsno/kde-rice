@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/display-state.sh
+source "$SCRIPT_DIR/lib/display-state.sh"
+
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+STEP_RUNNER=${KDE_RICE_STEP_RUNNER:-}
+FASTFETCH_COMPONENT="$SCRIPT_DIR/apply-fastfetch"
+PANEL_PROBE="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v02/contents/panel-state.js"
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/bootstrap [OPTIONS]
+
+Diagnose and print one complete Minimalist v0.4.1 plan. Dry-run is the default.
+
+Options:
+  --home ABSOLUTE_PATH  Target home (default: $HOME; must be current user)
+  --apply               Snapshot and perform the live desktop plan
+  --dry-run             Explicitly select the no-write default
+  --allow-degraded      Permit an explicitly reviewed degraded Plasma 6 apply
+  -h, --help            Show this help
+
+An unsupported doctor result and an unknown panel topology are never
+overridden. Exit codes: 0 success, 1 refusal/step failure, 64 usage error.
+EOF
+}
+
+usage_error() {
+    printf 'error: %s\n' "$*" >&2
+    printf 'Try scripts/bootstrap --help for usage.\n' >&2
+    exit 64
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || usage_error "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) usage_error "unknown argument: $1" ;;
+    esac
+done
+
+for command_name in realpath date sed awk sha256sum tar readlink cp mv mkdir ln; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+        printf 'error: required command not found: %s\n' "$command_name" >&2
+        exit 1
+    }
+done
+refuse_root
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_STEP_RUNNER || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal bootstrap overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" bootstrap-mock
+load_managed_paths "$MANIFEST"
+[[ -x $DOCTOR_COMMAND ]] || {
+    printf 'error: doctor command is unavailable: %s\n' "$DOCTOR_COMMAND" >&2
+    exit 1
+}
+[[ -f $PANEL_PROBE ]] || {
+    printf 'error: panel-state probe is unavailable: %s\n' "$PANEL_PROBE" >&2
+    exit 1
+}
+[[ -x $FASTFETCH_COMPONENT ]] || {
+    printf 'error: Fastfetch component is unavailable: %s\n' "$FASTFETCH_COMPONENT" >&2
+    exit 1
+}
+if [[ -n $STEP_RUNNER && ! -x $STEP_RUNNER ]]; then
+    printf 'error: configured step runner is not executable: %s\n' "$STEP_RUNNER" >&2
+    exit 1
+fi
+
+printf 'Minimalist v0.4.1 bootstrap: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf 'Wallpaper policy: preserve the current user-owned wallpaper\n\n'
+printf '1. Environment diagnosis (read-only)\n'
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) compatibility=supported ;;
+    1) compatibility=degraded ;;
+    2)
+        printf '\nREFUSED: doctor classified this environment as unsupported; no snapshot or setting was written.\n' >&2
+        exit 1
+        ;;
+    *)
+        printf '\nREFUSED: doctor could not produce a trustworthy compatibility result (exit %d).\n' "$doctor_status" >&2
+        exit 1
+        ;;
+esac
+if [[ $compatibility == degraded ]]; then
+    printf '\nwarning: doctor classified this environment as degraded.\n' >&2
+    if $APPLY && ! $ALLOW_DEGRADED; then
+        printf 'REFUSED: review the reasons, then explicitly use --allow-degraded if its documented limits are acceptable.\n' >&2
+        exit 1
+    fi
+fi
+
+DBUS_TOOL=$(resolve_dbus_tool) || {
+    printf 'error: qdbus6 or a compatible Qt D-Bus tool is unavailable\n' >&2
+    exit 1
+}
+set +e
+panel_output=$("$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+    org.kde.PlasmaShell.evaluateScript "$(< "$PANEL_PROBE")" 2>&1)
+panel_status=$?
+set -e
+if ((panel_status != 0)); then
+    printf 'error: running plasmashell could not be inspected: %s\n' "$panel_output" >&2
+    exit 1
+fi
+panel_output=$(normalize_plasma_probe_output "$panel_output")
+panel_marker=$(printf '%s\n' "$panel_output" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q;}')
+[[ -n $panel_marker ]] || {
+    printf 'error: panel-state probe returned no stable summary\n' >&2
+    exit 1
+}
+
+marker_field() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*) printf '%s\n' "${token#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+signature=$(marker_field "$panel_marker" signature) || {
+    printf 'error: panel-state summary omitted its signature\n' >&2
+    exit 1
+}
+transition=$(marker_field "$panel_marker" transition) || {
+    printf 'error: panel-state summary omitted its transition\n' >&2
+    exit 1
+}
+remove_panel_ids=$(marker_field "$panel_marker" removePanelIds || printf none)
+remove_widget_entries=$(marker_field "$panel_marker" removeWidgetEntries || printf none)
+panel_count=$(marker_field "$panel_marker" panelCount || printf unknown)
+desktop_count=$(marker_field "$panel_marker" desktopCount || printf unknown)
+current_geometry=$(marker_field "$panel_marker" geometry || printf unknown)
+current_widgets=$(marker_field "$panel_marker" widgetTypes || printf unknown)
+target_widgets=$(marker_field "$panel_marker" targetWidgets) || {
+    printf 'error: panel-state summary omitted its target widgets\n' >&2
+    exit 1
+}
+
+panel_target=minimalist-v04
+case "$signature" in
+    plasma6-stock | plasma6-stock-ime)
+        panel_entry="$SCRIPT_DIR/apply-fresh"
+        panel_class=fresh
+        run_v03=true
+        ;;
+    minimalist-v01 | minimalist-v02-show-desktop | minimalist-v02-no-title \
+        | minimalist-v02-spacer-repair | minimalist-v02-title-repair)
+        panel_entry="$SCRIPT_DIR/apply-minimalist-v02"
+        panel_class=managed-transition
+        run_v03=true
+        ;;
+    minimalist-v02)
+        panel_entry="$SCRIPT_DIR/apply-minimalist-v02"
+        panel_class=managed-target
+        run_v03=true
+        ;;
+    minimalist-v03)
+        panel_entry=
+        panel_class=managed-transition
+        run_v03=false
+        ;;
+    minimalist-v04-spacer-staged)
+        panel_entry=
+        panel_class=managed-recovery
+        run_v03=false
+        ;;
+    minimalist-v04-task-front-staged)
+        panel_entry=
+        panel_class=managed-recovery
+        run_v03=false
+        ;;
+    minimalist-v04)
+        panel_entry=
+        panel_class=managed-target
+        run_v03=false
+        ;;
+    minimalist-v04-pager | minimalist-v04-workspaces)
+        panel_entry=
+        panel_class=managed-target
+        panel_target=$signature
+        run_v03=false
+        ;;
+    *)
+        printf '\nREFUSED: panel signature is unknown; no snapshot or setting was written.\n' >&2
+        printf 'Observed panel summary: %s\n' "$panel_marker" >&2
+        exit 1
+        ;;
+esac
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+transaction_id="$timestamp-bootstrap-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$transaction_id"
+receipt_path="$TARGET_HOME/.local/state/kde-rice/bootstrap/$transaction_id"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+printf -v resume_preview '%q --receipt %q --home %q' \
+    "$SCRIPT_DIR/resume-bootstrap" "$receipt_path" "$TARGET_HOME"
+printf -v resume_apply '%s --apply' "$resume_preview"
+latest_link="$TARGET_HOME/.local/state/kde-rice/bootstrap/latest"
+temporary_link="$latest_link.kde-rice-new-$$"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$transaction_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/bootstrap/$transaction_id"
+if $APPLY; then
+    if [[ -e $receipt_path || -L $receipt_path ]]; then
+        printf 'REFUSED: bootstrap receipt path already exists: %s\n' "$receipt_path" >&2
+        exit 1
+    fi
+    if [[ -e $latest_link && ! -L $latest_link ]]; then
+        printf 'REFUSED: bootstrap latest pointer exists but is not a symlink: %s\n' "$latest_link" >&2
+        exit 1
+    fi
+    if [[ -e $temporary_link || -L $temporary_link ]]; then
+        printf 'REFUSED: temporary latest pointer already exists: %s\n' "$temporary_link" >&2
+        exit 1
+    fi
+fi
+
+printf '\n2. Compatibility and topology decision\n'
+printf '  compatibility: %s\n' "$compatibility"
+printf '  panel class: %s\n' "$panel_class"
+printf '  panel signature: %s\n' "$signature"
+printf '  panel transition: %s\n' "$transition"
+printf '  current panel count: %s\n' "$panel_count"
+printf '  current desktop-containment count: %s\n' "$desktop_count"
+printf '  current panel geometry tuple: %s\n' "$current_geometry"
+printf '  current ordered widgets: %s\n' "$current_widgets"
+
+printf '\n3. Complete ordered change plan\n'
+printf '  snapshot all exact paths in config/managed-paths.txt -> %s\n' "$snapshot_path"
+printf '  exact snapshot/restore scope:\n'
+for relative in "${MANAGED_PATHS[@]}"; do
+    printf '    %s\n' "$relative"
+done
+printf '  fastfetch: install the medium-density privacy-safe config at .config/fastfetch/config.jsonc\n'
+printf '  fastfetch package: linux-workstation owns the installed prerequisite; kde-rice manages only its config\n'
+printf '  wallpaper: do not install, select, migrate, or verify; preserve the current user-owned choice\n'
+printf '  appearance: install/activate BlackMinimal colors and BlackMinimal.profile\n'
+printf '  shell: activate Breeze Plasma Style and Breeze window decoration\n'
+if [[ -n $panel_entry ]]; then
+    printf '  base panel entry point: %s\n' "$panel_entry"
+elif [[ $signature == minimalist-v03 ]]; then
+    printf '  base panel entry point: none; migrate the exact Minimalist v0.3 panel directly\n'
+elif [[ $signature == minimalist-v04-spacer-staged ]]; then
+    printf '  base panel entry point: none; recover the recognized v0.4.1 staged spacer state\n'
+elif [[ $signature == minimalist-v04-task-front-staged ]]; then
+    printf '  base panel entry point: none; recover the recognized v0.4.1 task-front state\n'
+elif [[ $signature == minimalist-v04-pager ]]; then
+    printf '  base panel entry point: none; the exact Minimalist v0.4.1 Pager target is already active\n'
+elif [[ $signature == minimalist-v04-workspaces ]]; then
+    printf '  base panel entry point: none; the exact Minimalist v0.4.1 Workspaces target is already active\n'
+else
+    printf '  base panel entry point: none; the exact Minimalist v0.4.1 panel is already active\n'
+fi
+if [[ $panel_class == fresh ]]; then
+    printf '  replace panel ids: %s\n' "$remove_panel_ids"
+    printf '  remove widgets (id:type): %s\n' "$remove_widget_entries"
+    printf '  create one panel: screen=0 top horizontal height=32 fill opaque non-floating\n'
+else
+    if [[ $signature == minimalist-v04-task-front-staged ]]; then
+        printf '  recovery removals: the misplaced v0.4.1 task manager and right spacer only\n'
+    else
+        printf '  panel removals: none\n'
+    fi
+    if [[ $panel_class == managed-target ]]; then
+        printf '  preserve the existing panel/widget instances; reassert exact target policy idempotently\n'
+    elif [[ $signature == minimalist-v04-spacer-staged ]]; then
+        printf '  preserve the staged expanding spacer and add only the missing task manager\n'
+    elif [[ $signature == minimalist-v04-task-front-staged ]]; then
+        printf '  preserve every v0.3 widget instance; rebuild only the two v0.4.1 additions after cleanup\n'
+    elif [[ $signature == minimalist-v03 ]]; then
+        printf '  preserve every v0.3 panel/widget instance; add one task manager and one expanding spacer\n'
+    else
+        printf '  use the existing narrow v0.1/v0.2 transition guard; do not replace an arbitrary panel\n'
+    fi
+fi
+case "$current_geometry" in
+    0,top,horizontal,28,*)
+        printf '  panel height migration: 28 -> 32 logical px; preserve the panel and widget instances\n'
+        ;;
+    0,top,horizontal,32,*)
+        printf '  panel height: keep/reassert 32 logical px\n'
+        ;;
+    *)
+        printf '  target panel height: 32 logical px\n'
+        ;;
+esac
+if $run_v03; then
+    printf '  resource-strip entry point: %s\n' "$SCRIPT_DIR/apply-minimalist-v03"
+else
+    printf '  resource-strip entry point: none; the recognized source already contains the v0.3 resource widget\n'
+fi
+printf '  final panel entry point: %s\n' "$SCRIPT_DIR/apply-minimalist-v04"
+if [[ -n $panel_entry ]]; then
+    printf '  base widget order: %s\n' "$target_widgets"
+fi
+case "$signature" in
+    minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces)
+        printf '  v0.4.1 panel additions: none; preserve and reconfigure the existing switcher (if present), native task manager, and both spacers\n'
+        ;;
+    minimalist-v04-spacer-staged)
+        printf '  v0.4.1 panel additions: one Icons-only Task Manager before the staged right spacer\n'
+        ;;
+    minimalist-v04-task-front-staged)
+        printf '  v0.4.1 panel additions after cleanup: one settled right spacer, then one Icons-only Task Manager\n'
+        ;;
+    *)
+        printf '  v0.4.1 panel additions: one Icons-only Task Manager and one second expanding spacer\n'
+        ;;
+esac
+case "$signature" in
+    minimalist-v04-pager)
+        printf '  final widget order: launcher | Pager | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+    minimalist-v04-workspaces)
+        printf '  final widget order: launcher | Workspaces | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+    *)
+        printf '  final widget order: launcher | active title | spacer | pinned/running apps | spacer | CPU/RAM/GPU/VOL | margin | input | tray | time\n'
+        ;;
+esac
+printf '  clock policy: date hidden; 24-hour time with seconds; fixed Noto Sans 11 pt\n'
+printf '  task-manager launchers: user-owned; bootstrap and idempotent v0.4.1 apply do not enforce an application list\n'
+printf '  verify: Fastfetch, colors, Konsole, Breeze, exact %s panel/task/tray/clock/Plasmoid policy, duplicates, display fingerprints\n' "$panel_target"
+printf '  excluded and untouched: resolution, scale, output placement, HDR, VRR, refresh rate\n'
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ $compatibility == degraded && $panel_class == fresh ]]; then
+    printf '  expected Plasma 6.7 checkpoint: if only panel opacity remains Adaptive, change only that panel to Opaque in edit mode\n'
+    printf '  continue the same transaction after Opaque; do not start a new live bootstrap\n'
+    printf 'Resume preview after Opaque: %s\n' "$resume_preview"
+    printf 'Resume apply after reviewing preview: %s\n' "$resume_apply"
+fi
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, receipt, asset, panel, widget, or KDE setting was written.\n'
+    exit 0
+fi
+
+display_before=$(display_state_lines "$TARGET_HOME") || {
+    printf 'error: excluded display paths could not be fingerprinted safely\n' >&2
+    exit 1
+}
+
+printf '\n4. Baseline snapshot (first write)\n'
+if ! "$SCRIPT_DIR/snapshot" --home "$TARGET_HOME" --output "$snapshot_path"; then
+    printf 'BOOTSTRAP FAILED: baseline snapshot failed; no apply step was started.\n' >&2
+    printf 'Incomplete snapshot path, if created: %s\n' "$snapshot_path" >&2
+    exit 1
+fi
+[[ -f $snapshot_path/complete ]] || {
+    printf 'BOOTSTRAP FAILED: baseline snapshot did not complete; no apply step was started.\n' >&2
+    printf 'Incomplete snapshot path: %s\n' "$snapshot_path" >&2
+    exit 1
+}
+
+current_step=receipt-initialization
+transaction_failure() {
+    local status=$1
+    local message=$2
+    trap - ERR
+    if [[ -d $receipt_path ]]; then
+        printf '%s\t%s\n' "$current_step" "$status" > "$receipt_path/failed" 2>/dev/null || true
+        display_state_lines "$TARGET_HOME" > "$receipt_path/display-state.failure.tsv" 2>/dev/null || true
+    fi
+    printf '\nBOOTSTRAP FAILED: %s\n' "$message" >&2
+    printf 'Completed state may be partial; it was not hidden or automatically overwritten.\n' >&2
+    if [[ -d $receipt_path ]]; then
+        printf 'Transaction receipt: %s\n' "$receipt_path" >&2
+        printf 'Failed step: %s (status %s)\n' "$current_step" "$status" >&2
+    fi
+    printf 'Baseline snapshot: %s\n' "$snapshot_path" >&2
+    printf 'Restore preview: %s\n' "$restore_preview" >&2
+    printf 'Restore apply: %s\n' "$restore_apply" >&2
+    if [[ $current_step == panel && $compatibility == degraded \
+        && ( $signature == plasma6-stock || $signature == plasma6-stock-ime ) ]]; then
+        printf '\nIf the component output above reports that only Opaque is missing:\n' >&2
+        printf '  1. Change only the new panel opacity to Opaque in Plasma edit mode; do not reorder widgets.\n' >&2
+        printf '  2. Continue this receipt; do not start a new live bootstrap transaction.\n' >&2
+        printf 'Resume preview: %s\n' "$resume_preview" >&2
+        printf 'Resume apply after reviewing preview: %s\n' "$resume_apply" >&2
+    fi
+    printf 'Plasma and KWin were not forcibly restarted.\n' >&2
+    exit 1
+}
+trap 'transaction_failure $? "unexpected failure during $current_step"' ERR
+
+umask 077
+mkdir -p -- "$receipt_path"
+printf '%s\n' "$snapshot_path" > "$receipt_path/snapshot-path"
+printf '%s\n' "$signature" > "$receipt_path/panel-signature.before"
+printf '%s\n' "$panel_target" > "$receipt_path/panel-target"
+printf '%s\n' "$compatibility" > "$receipt_path/compatibility"
+printf '%s\n' "$display_before" > "$receipt_path/display-state.before.tsv"
+export KDE_RICE_TRANSACTION_SNAPSHOT="$snapshot_path"
+export KDE_RICE_TRANSACTION_RECEIPT="$receipt_path"
+
+run_component() {
+    if [[ -n $STEP_RUNNER ]]; then
+        "$STEP_RUNNER" "$@"
+    else
+        "$@"
+    fi
+}
+
+printf '\n5. Apply approved steps\n'
+current_step=fastfetch
+run_component "$FASTFETCH_COMPONENT" --home "$TARGET_HOME" --apply \
+    || transaction_failure $? "Fastfetch configuration step failed"
+current_step=black-minimal
+run_component "$SCRIPT_DIR/apply-black" --home "$TARGET_HOME" --apply \
+    || transaction_failure $? "Black Minimal step failed"
+current_step=breeze-shell
+run_component "$SCRIPT_DIR/apply-modern" --home "$TARGET_HOME" --apply \
+    || transaction_failure $? "Breeze shell step failed"
+current_step=panel
+if [[ -n $panel_entry ]]; then
+    panel_arguments=(--home "$TARGET_HOME" --apply)
+    if $ALLOW_DEGRADED && [[ $panel_entry == "$SCRIPT_DIR/apply-fresh" ]]; then
+        panel_arguments+=(--allow-degraded)
+    fi
+    run_component "$panel_entry" "${panel_arguments[@]}" \
+        || transaction_failure $? "base panel/Plasmoid step failed"
+fi
+if $run_v03; then
+    current_step=resource-strip
+    resource_arguments=(--home "$TARGET_HOME" --apply)
+    if $ALLOW_DEGRADED; then
+        resource_arguments+=(--allow-degraded)
+    fi
+    run_component "$SCRIPT_DIR/apply-minimalist-v03" "${resource_arguments[@]}" \
+        || transaction_failure $? "Minimalist v0.3 resource-strip step failed"
+fi
+current_step=task-manager
+v04_arguments=(--home "$TARGET_HOME" --apply)
+if $ALLOW_DEGRADED; then
+    v04_arguments+=(--allow-degraded)
+fi
+run_component "$SCRIPT_DIR/apply-minimalist-v04" "${v04_arguments[@]}" \
+    || transaction_failure $? "Minimalist v0.4.1 task-manager step failed"
+
+current_step=display-preservation
+display_after=$(display_state_lines "$TARGET_HOME") \
+    || transaction_failure 1 "excluded display paths could not be fingerprinted after apply"
+printf '%s\n' "$display_after" > "$receipt_path/display-state.after.tsv"
+printf 'ready\n' > "$receipt_path/verification-ready"
+if [[ $display_before != "$display_after" ]]; then
+    transaction_failure 1 "excluded display configuration changed during apply"
+fi
+
+printf '\n6. Read-only verification\n'
+current_step=verify
+trap - ERR
+set +e
+if [[ -n $STEP_RUNNER ]]; then
+    "$STEP_RUNNER" "$VERIFY_COMMAND" --home "$TARGET_HOME" --receipt "$receipt_path" \
+        --panel-target "$panel_target"
+    verify_status=$?
+else
+    "$VERIFY_COMMAND" --home "$TARGET_HOME" --receipt "$receipt_path" \
+        --panel-target "$panel_target"
+    verify_status=$?
+fi
+set -e
+if ((verify_status != 0)); then
+    transaction_failure "$verify_status" "post-apply verification failed"
+fi
+trap 'transaction_failure $? "unexpected failure during $current_step"' ERR
+
+current_step=receipt-finalization
+printf 'complete\n' > "$receipt_path/complete"
+ln -s -- "$receipt_path" "$temporary_link"
+mv -Tf -- "$temporary_link" "$latest_link"
+trap - ERR
+
+printf '\nBootstrap complete and mechanically verified.\n'
+printf 'Transaction receipt: %s\n' "$receipt_path"
+printf 'Baseline snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+printf 'Plasma and KWin were not forcibly restarted. Display configuration matched its baseline fingerprint.\n'

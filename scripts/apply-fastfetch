@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+SOURCE_RELATIVE="config/fastfetch/config.jsonc"
+TARGET_RELATIVE=".config/fastfetch/config.jsonc"
+TARGET_HOME=${HOME:-}
+APPLY=false
+INSTALL_ONLY=false
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-fastfetch [OPTIONS]
+
+Preview or install the project Fastfetch presentation. Preview is the default.
+The script never installs a system package or edits shell startup files.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Capture a baseline and install the configuration
+  --dry-run             Explicitly select preview mode (default)
+  --install-only        Permit asset installation for an isolated non-live home
+  -h, --help            Show this help
+
+Fastfetch must already be supplied by the linux-workstation host layer.
+Existing configuration is snapshotted and can be restored with the command
+printed after apply.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --install-only)
+            INSTALL_ONLY=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+for command_name in realpath date cp mv mkdir cmp fastfetch; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+load_managed_paths "$MANIFEST"
+
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+
+validate_relative_path "$TARGET_RELATIVE" || die "unsafe Fastfetch target: $TARGET_RELATIVE"
+[[ -n ${managed[$TARGET_RELATIVE]+x} ]] \
+    || die "Fastfetch target is not managed: $TARGET_RELATIVE"
+source_path="$REPO_ROOT/$SOURCE_RELATIVE"
+[[ -f $source_path && ! -L $source_path ]] \
+    || die "Fastfetch source is missing or unsafe: $SOURCE_RELATIVE"
+assert_parent_within_home "$TARGET_HOME" "$TARGET_RELATIVE"
+
+if ! $INSTALL_ONLY; then
+    require_current_desktop_home "$TARGET_HOME"
+fi
+
+if ! fastfetch --config "$source_path" >/dev/null 2>&1; then
+    die "project Fastfetch configuration is not accepted by the installed Fastfetch"
+fi
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-fastfetch-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+
+printf 'Fastfetch mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n\n' "$TARGET_HOME"
+printf 'Complete change plan:\n'
+printf 'install %-42s -> %s\n' "$SOURCE_RELATIVE" "$TARGET_RELATIVE"
+printf 'presentation: automatic distro logo; medium-density system, KDE, terminal, and hardware groups\n'
+printf 'privacy: omit Host, Local IP, public IP, and other network identifiers\n'
+printf 'title: omit the user/host title and its underline\n'
+printf 'package policy: linux-workstation owns the installed Fastfetch prerequisite; kde-rice manages only its presentation\n'
+printf 'shell policy: do not edit .bashrc, .zshrc, or another startup file\n'
+printf 'snapshot before write: %s\n' "$snapshot_path"
+printf 'rollback preview: %s/restore --backup %s --home %s\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+printf 'rollback apply: %s/restore --backup %s --home %s --apply\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot or Fastfetch setting was written.\n'
+    exit 0
+fi
+
+printf '\nCapturing pre-apply snapshot...\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+apply_error() {
+    local status=$?
+    warn "Fastfetch apply stopped after an error"
+    warn "rollback preview: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME"
+    warn "rollback apply: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME --apply"
+    exit "$status"
+}
+trap apply_error ERR
+
+umask 077
+destination="$TARGET_HOME/$TARGET_RELATIVE"
+temporary="$destination.kde-rice-new-$$"
+current=$(path_type "$destination")
+[[ $current != unsupported ]] || die "Fastfetch target has an unsupported type: $TARGET_RELATIVE"
+[[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
+mkdir -p -- "$(dirname -- "$destination")"
+cp -a -- "$source_path" "$temporary"
+if [[ $current != absent ]]; then
+    mkdir -p -- "$displaced_path/$(dirname -- "$TARGET_RELATIVE")"
+    mv -- "$destination" "$displaced_path/$TARGET_RELATIVE"
+fi
+mv -- "$temporary" "$destination"
+
+cmp -s -- "$source_path" "$destination" || die "installed Fastfetch configuration differs from its source"
+HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" \
+    fastfetch --config "$destination" >/dev/null 2>&1 \
+    || die "installed Fastfetch configuration did not render successfully"
+
+trap - ERR
+printf '\nFastfetch apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s/restore --backup %s --home %s\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+printf 'Restore apply: %s/restore --backup %s --home %s --apply\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced Fastfetch setting: %s\n' "$displaced_path"
+fi
+printf 'Run fastfetch explicitly to display the configured summary; shell startup files were untouched.\n'

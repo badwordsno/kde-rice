@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+ACTIVE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.activewindowtitle"
+ACTIVE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle"
+WORKSPACE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.workspaces"
+WORKSPACE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.workspaces"
+RESOURCE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.resources"
+RESOURCE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.resources"
+PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-panel-font-policy [OPTIONS]
+
+Preview or apply the Fedora 44 Noto Sans panel typography policy. On the
+exact 32px Minimalist v0.4.1 Workspaces target, the guarded apply refreshes the
+three project widgets in place and changes only the existing Digital Clock's
+font family. Panel geometry, other widgets, and KWin remain unchanged.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot and apply the panel font policy
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded apply
+  -h, --help            Show this help
+
+Every topology except the exact Workspaces target is refused. Plasma and KWin
+are never restarted.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply) APPLY=true; shift ;;
+        --dry-run) APPLY=false; shift ;;
+        --allow-degraded) ALLOW_DEGRADED=true; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+for command_name in realpath cp date mv mkdir diff sleep jq fc-match; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_FONT_MATCH ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal panel-font overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; panel-font apply is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+font_match=${KDE_RICE_FONT_MATCH:-}
+if [[ -z $font_match ]]; then
+    font_match=$(fc-match -f '%{family}\n' 'Noto Sans')
+    font_match=${font_match%%$'\n'*}
+fi
+[[ $font_match == "Noto Sans" || $font_match == "Noto Sans,"* ]] \
+    || die "Noto Sans does not resolve to the required Fedora font family: $font_match"
+printf 'Confirmed font: Noto Sans (%s)\n' "$font_match"
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+load_managed_paths "$MANIFEST"
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do managed[$relative]=1; done
+targets=(
+    "$LAYOUT_TARGET_RELATIVE"
+    "$ACTIVE_TARGET_RELATIVE"
+    "$WORKSPACE_TARGET_RELATIVE"
+    "$RESOURCE_TARGET_RELATIVE"
+    "$PANEL_CONFIG_RELATIVE"
+)
+for target_relative in "${targets[@]}"; do
+    validate_relative_path "$target_relative" || die "unsafe panel-font target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] || die "panel-font target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+
+layout_source="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+active_source="$REPO_ROOT/$ACTIVE_SOURCE_RELATIVE"
+workspace_source="$REPO_ROOT/$WORKSPACE_SOURCE_RELATIVE"
+resource_source="$REPO_ROOT/$RESOURCE_SOURCE_RELATIVE"
+for source_directory in "$layout_source" "$active_source" "$workspace_source" "$resource_source"; do
+    [[ -d $source_directory && ! -L $source_directory ]] \
+        || die "panel-font source directory is missing or unsafe: $source_directory"
+done
+for source_file in font-preflight.js font-layout.js font-postcheck.js font-restore.js; do
+    [[ -f $layout_source/contents/$source_file && ! -L $layout_source/contents/$source_file ]] \
+        || die "panel-font layout source is incomplete: $source_file"
+done
+for package_source in "$active_source" "$workspace_source" "$resource_source"; do
+    for source_file in metadata.json contents/ui/main.qml; do
+        [[ -f $package_source/$source_file && ! -L $package_source/$source_file ]] \
+            || die "panel-font package source is incomplete: $package_source/$source_file"
+    done
+done
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+marker_field() {
+    local marker=$1 wanted=$2 token
+    local -a tokens
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*) printf '%s\n' "${token#*=}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+printf 'Minimalist panel font policy mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\n1. Current topology and font state (read-only)\n'
+preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/font-preflight.js")")
+printf '%s\n' "$preflight"
+[[ $preflight == *MINIMALIST_FONT_PREFLIGHT_OK* \
+    && $preflight == *" topologyOk=true "* \
+    && $preflight == *" geometryOk=true "* \
+    && $preflight == *" anchorsReady=true "* \
+    && $preflight == *" customTypesKnown=true "* ]] \
+    || die "panel font policy requires the exact recognized 32px Workspaces target"
+initial_font_state=$(marker_field "$preflight" fontState) \
+    || die "panel font preflight omitted its exact source state"
+case "$initial_font_state" in source | target) ;; *) die "unknown panel font state" ;; esac
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-panel-font-policy-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\n2. Complete change plan\n'
+printf '  current accepted topology: minimalist-v04-workspaces on one screen-0 top panel at 32 logical px\n'
+printf '  current font state: %s\n' "$initial_font_state"
+printf '  selected Fedora family: Noto Sans (Regular; clock remains 11 pt/400)\n'
+printf '  managed asset writes:\n'
+printf '    %s -> %s\n' "$ACTIVE_SOURCE_RELATIVE" "$ACTIVE_TARGET_RELATIVE"
+printf '    %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
+printf '    %s -> %s\n' "$RESOURCE_SOURCE_RELATIVE" "$RESOURCE_TARGET_RELATIVE"
+printf '    %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed Plasma config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+if [[ $initial_font_state == source ]]; then
+    printf '  panel removals: exactly one active-title, one Workspaces, and one resource project widget\n'
+    printf '  panel additions: exactly the same three project widgets at their existing geometry anchors\n'
+else
+    printf '  panel removals/additions: none (the exact font target is already live)\n'
+fi
+printf '  project widget font policy writes: General/fontPolicyRevision=2; existing package revisions preserved\n'
+printf '  built-in Digital Clock write: Appearance/fontFamily=Noto Sans only\n'
+printf '  preserve: clock instance/calendar/time zones, widget order, task launchers, panel geometry, wallpaper, shortcuts, KWin, and display modes\n'
+printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
+printf '  snapshot destination: %s\n' "$snapshot_path"
+if [[ $initial_font_state == source ]]; then
+    printf '  automatic failure rollback: restore the complete snapshot, then reload its three prior project packages and Noto Sans Mono clock family live\n'
+else
+    printf '  automatic failure rollback: restore the complete snapshot; no widget instance is replaced\n'
+fi
+printf '  rollback preview: %s\n' "$restore_preview"
+printf '  rollback apply: %s\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, package, widget, clock, panel, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n3. Capturing the complete managed scope before the first write\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+font_write_attempted=false
+apply_error() {
+    local status=$? restore_status=0 restore_result=
+    trap - EXIT
+    set +e
+    warn "panel-font apply stopped after an error; Plasma and KWin were not restarted"
+    "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
+    restore_status=$?
+    if ((restore_status == 0)); then
+        warn "pre-apply managed files were restored automatically"
+        if [[ $initial_font_state == source && $font_write_attempted == true ]]; then
+            restore_result=$(evaluate_plasma_script "$(< "$layout_source/contents/font-restore.js")" 2>&1)
+            if [[ $restore_result == *MINIMALIST_FONT_RESTORE_OK* ]]; then
+                warn "the three snapshotted project packages and prior clock family were reloaded live"
+            else
+                warn "live package reload could not prove a safe exact target; no unrelated widget was removed"
+            fi
+        fi
+    else
+        warn "automatic snapshot restore failed; use: $restore_apply"
+    fi
+    exit "$status"
+}
+trap apply_error EXIT
+
+install_managed_directory() {
+    local source=$1 target_relative=$2
+    local destination="$TARGET_HOME/$target_relative"
+    local temporary="$destination.kde-rice-new-$$"
+    local current
+    current=$(path_type "$destination")
+    [[ $current != unsupported ]] || die "managed target has an unsupported type: $target_relative"
+    [[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source" "$temporary"
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced_path/$(dirname -- "$target_relative")"
+        mv -- "$destination" "$displaced_path/$target_relative"
+    fi
+    mv -- "$temporary" "$destination"
+    diff -qr -- "$source" "$destination" >/dev/null \
+        || die "installed managed directory differs from source: $target_relative"
+}
+
+printf '\n4. Installing the exact Noto Sans project packages and layout asset\n'
+umask 077
+install_managed_directory "$active_source" "$ACTIVE_TARGET_RELATIVE"
+install_managed_directory "$workspace_source" "$WORKSPACE_TARGET_RELATIVE"
+install_managed_directory "$resource_source" "$RESOURCE_TARGET_RELATIVE"
+install_managed_directory "$layout_source" "$LAYOUT_TARGET_RELATIVE"
+
+printf '\n5. Rechecking the exact topology and source state before the live write\n'
+write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-preflight.js")")
+printf '%s\n' "$write_preflight"
+[[ $write_preflight == *MINIMALIST_FONT_PREFLIGHT_OK* \
+    && $write_preflight == *" fontState=$initial_font_state "* ]] \
+    || die "panel or font state changed before the guarded live write"
+
+printf '\n6. Refreshing the project widgets and built-in clock font\n'
+font_write_attempted=true
+layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-layout.js")")
+printf '%s\n' "$layout_result"
+[[ $layout_result == *MINIMALIST_FONT_LAYOUT_OK* ]] \
+    || die "Plasma did not confirm the panel font write"
+
+printf '\n7. Read-only panel-font postcheck\n'
+post_result=
+for attempt in {1..20}; do
+    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-postcheck.js")")
+    [[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] && break
+    ((attempt == 20)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] \
+    || die "live panel font topology or policy did not settle to the exact target"
+
+printf '\n8. Repository read-only verification\n'
+set +e
+verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
+    --panel-target minimalist-v04-workspaces --json 2>&1)
+verify_status=$?
+set -e
+printf '%s\n' "$verify_output"
+verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
+    '[.checks[] | select(.name != "display_configuration_unchanged" and .ok != true)] | length' \
+    2>/dev/null) || die "repository verification output was malformed"
+((verify_non_display_failures == 0)) || die "repository verification found an in-scope mismatch"
+if ((verify_status != 0)); then
+    warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
+fi
+
+trap - EXIT
+printf '\nMinimalist panel font policy apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ -d $displaced_path ]]; then printf 'Replaced managed assets: %s\n' "$displaced_path"; fi
+printf 'Result: active title, Workspaces, resources, and Digital Clock use Noto Sans.\n'
+printf 'No other widget, panel geometry, task launcher, KWin state, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'

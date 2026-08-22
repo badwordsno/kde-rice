@@ -1,0 +1,21 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "badwordsno"
+            }
+        ],
+        "BugReportUrl": "https://github.com/badwordsno/minimalist-black-kde/issues",
+        "Description": "A true-black Plasma 6 appearance built on Breeze",
+        "Description[ko]": "Breeze를 기반으로 한 진정한 검은색 Plasma 6 외형",
+        "Icon": "preferences-desktop-theme-global",
+        "Id": "io.github.badwordsno.minimalistblack",
+        "License": "MIT",
+        "Name": "Minimalist Black",
+        "Name[ko]": "미니멀리스트 블랙",
+        "Version": "1.0.0",
+        "Website": "https://github.com/badwordsno/minimalist-black-kde"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

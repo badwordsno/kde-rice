@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/display-state.sh
+source "$SCRIPT_DIR/lib/display-state.sh"
+
+TARGET_HOME=${HOME:-}
+RECEIPT=
+RESUME_RECEIPT=false
+JSON=false
+PANEL_TARGET=minimalist-v04
+PANEL_PROBE="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v02/contents/panel-state.js"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/verify [OPTIONS]
+
+Read-only verification of an active Minimalist KDE session.
+
+Options:
+  --home ABSOLUTE_PATH  Target home (default: $HOME; live session must match)
+  --receipt PATH        Successful bootstrap receipt to verify
+  --resume-receipt PATH Read-only check of a failed receipt after manual repair
+  --panel-target NAME   Expected panel target (default: minimalist-v04)
+  --json                Emit one JSON document
+  -h, --help            Show this help
+
+Exit codes: 0 target verified, 1 mismatch, 2 unable to verify, 64 usage error.
+EOF
+}
+
+usage_error() {
+    printf 'error: %s\n' "$*" >&2
+    exit 64
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || usage_error "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --receipt)
+            (($# >= 2)) || usage_error "--receipt requires a path"
+            $RESUME_RECEIPT && usage_error "--receipt and --resume-receipt are mutually exclusive"
+            RECEIPT=$2
+            shift 2
+            ;;
+        --resume-receipt)
+            (($# >= 2)) || usage_error "--resume-receipt requires a path"
+            [[ -z $RECEIPT ]] || usage_error "--receipt and --resume-receipt are mutually exclusive"
+            RECEIPT=$2
+            RESUME_RECEIPT=true
+            shift 2
+            ;;
+        --panel-target)
+            (($# >= 2)) || usage_error "--panel-target requires a value"
+            PANEL_TARGET=$2
+            shift 2
+            ;;
+        --json)
+            JSON=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) usage_error "unknown argument: $1" ;;
+    esac
+done
+
+case "$PANEL_TARGET" in
+    minimalist-v02 | minimalist-v03 | minimalist-v04 | minimalist-v04-pager \
+        | minimalist-v04-workspaces) ;;
+    *) usage_error "unsupported panel target: $PANEL_TARGET" ;;
+esac
+
+if ! command -v realpath >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1 \
+    || ! command -v sha256sum >/dev/null 2>&1 || ! command -v diff >/dev/null 2>&1; then
+    printf 'error: core read-only verification tools are unavailable\n' >&2
+    exit 2
+fi
+if ((EUID == 0)); then
+    printf 'error: run kde-rice as the desktop user, never as root\n' >&2
+    exit 2
+fi
+if [[ -z $TARGET_HOME || $TARGET_HOME != /* || ! -d $TARGET_HOME ]]; then
+    printf 'error: target home is not an existing absolute directory: %s\n' "$TARGET_HOME" >&2
+    exit 2
+fi
+TARGET_HOME=$(realpath -e -- "$TARGET_HOME") || exit 2
+if [[ ( -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_KWIN_BUSCTL ) \
+    && ${KDE_RICE_TEST_MODE:-0} != 1 ]]; then
+    printf 'error: verification tool overrides are available only in isolated test mode\n' >&2
+    exit 2
+fi
+home_guard_error=
+if ! home_guard_error=$(require_current_desktop_home "$TARGET_HOME" dbus-mock 2>&1); then
+    printf '%s\n' "$home_guard_error" >&2
+    exit 2
+fi
+DBUS_TOOL=$(resolve_dbus_tool) || {
+    printf 'error: qdbus6 or a compatible Qt D-Bus tool is unavailable\n' >&2
+    exit 2
+}
+[[ -f $PANEL_PROBE ]] || {
+    printf 'error: repository verification probes are incomplete\n' >&2
+    exit 2
+}
+
+declare -a check_names=()
+declare -a check_ok=()
+declare -a check_expected=()
+declare -a check_actual=()
+add_check() {
+    check_names+=("$1")
+    check_ok+=("$2")
+    check_expected+=("$3")
+    check_actual+=("$4")
+}
+
+marker_field() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+read_kconfig() {
+    local file=$1 group=$2 key=$3
+    if [[ ! -e $file && ! -L $file ]]; then
+        return 0
+    fi
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    kreadconfig6 --file "$file" --group "$group" --key "$key" 2>/dev/null
+}
+
+if ! command -v kreadconfig6 >/dev/null 2>&1; then
+    printf 'error: kreadconfig6 is unavailable\n' >&2
+    exit 2
+fi
+
+color=$(read_kconfig "$TARGET_HOME/.config/kdeglobals" General ColorScheme) \
+    || { printf 'error: kdeglobals could not be read safely\n' >&2; exit 2; }
+selection=$(read_kconfig "$TARGET_HOME/.config/kdeglobals" "Colors:Selection" BackgroundNormal) \
+    || { printf 'error: kdeglobals selection color could not be read safely\n' >&2; exit 2; }
+profile=$(read_kconfig "$TARGET_HOME/.config/konsolerc" "Desktop Entry" DefaultProfile) \
+    || { printf 'error: konsolerc could not be read safely\n' >&2; exit 2; }
+plasma_theme=$(read_kconfig "$TARGET_HOME/.config/plasmarc" Theme name) \
+    || { printf 'error: plasmarc could not be read safely\n' >&2; exit 2; }
+decoration_library=$(read_kconfig "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 library) \
+    || { printf 'error: kwinrc could not be read safely\n' >&2; exit 2; }
+decoration_theme=$(read_kconfig "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 theme) \
+    || { printf 'error: kwinrc could not be read safely\n' >&2; exit 2; }
+plasma_theme=${plasma_theme:-default}
+decoration_library=${decoration_library:-org.kde.breeze}
+decoration_theme=${decoration_theme:-Breeze}
+[[ $color == BlackMinimal ]] && value=true || value=false
+add_check color_scheme "$value" BlackMinimal "${color:-missing}"
+[[ $selection == 145,70,255 ]] && value=true || value=false
+add_check selection_color "$value" 145,70,255 "${selection:-missing}"
+[[ $profile == BlackMinimal.profile ]] && value=true || value=false
+add_check konsole_default_profile "$value" BlackMinimal.profile "${profile:-missing}"
+[[ $plasma_theme == default ]] && value=true || value=false
+add_check plasma_style "$value" default "${plasma_theme:-missing}"
+[[ $decoration_library == org.kde.breeze && $decoration_theme == Breeze ]] && value=true || value=false
+add_check window_decoration "$value" org.kde.breeze/Breeze "${decoration_library:-missing}/${decoration_theme:-missing}"
+
+declare -a required_assets=(
+    .local/share/color-schemes/BlackMinimal.colors
+    .local/share/konsole/BlackMinimal.colorscheme
+    .local/share/konsole/BlackMinimal.profile
+    .local/share/plasma/layout-templates/org.kde.minimalist-v02/metadata.json
+    .local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle/metadata.json
+    .local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle/contents/ui/main.qml
+)
+if [[ $PANEL_TARGET == minimalist-v03 ]]; then
+    required_assets+=(
+        .local/share/plasma/layout-templates/org.kde.minimalist-v03/metadata.json
+        .local/share/plasma/plasmoids/org.kde.minimalist.resources/metadata.json
+        .local/share/plasma/plasmoids/org.kde.minimalist.resources/contents/ui/main.qml
+    )
+elif [[ $PANEL_TARGET == minimalist-v04 || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    required_assets+=(
+        .local/share/plasma/layout-templates/org.kde.minimalist-v04/metadata.json
+        .local/share/plasma/plasmoids/org.kde.minimalist.resources/metadata.json
+        .local/share/plasma/plasmoids/org.kde.minimalist.resources/contents/ui/main.qml
+    )
+    if [[ $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+        required_assets+=(
+            .local/share/plasma/plasmoids/org.kde.minimalist.workspaces/metadata.json
+            .local/share/plasma/plasmoids/org.kde.minimalist.workspaces/contents/ui/main.qml
+        )
+    fi
+fi
+missing_assets=()
+for relative in "${required_assets[@]}"; do
+    [[ -f $TARGET_HOME/$relative && ! -L $TARGET_HOME/$relative ]] || missing_assets+=("$relative")
+done
+if ((${#missing_assets[@]} == 0)); then
+    add_check project_assets true installed installed
+else
+    add_check project_assets false installed "missing:${missing_assets[*]}"
+fi
+installed_plasmoid="$TARGET_HOME/.local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle"
+source_plasmoid="$REPO_ROOT/plasmoids/org.kde.minimalist.activewindowtitle"
+if [[ -d $installed_plasmoid && ! -L $installed_plasmoid ]] \
+    && diff -qr -- "$source_plasmoid" "$installed_plasmoid" >/dev/null 2>&1; then
+    add_check project_plasmoid true exact-project-package exact-project-package
+else
+    add_check project_plasmoid false exact-project-package missing-or-modified
+fi
+if [[ $PANEL_TARGET == minimalist-v03 || $PANEL_TARGET == minimalist-v04 \
+    || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    installed_resources="$TARGET_HOME/.local/share/plasma/plasmoids/org.kde.minimalist.resources"
+    source_resources="$REPO_ROOT/plasmoids/org.kde.minimalist.resources"
+    if [[ -d $installed_resources && ! -L $installed_resources ]] \
+        && diff -qr -- "$source_resources" "$installed_resources" >/dev/null 2>&1; then
+        add_check resource_plasmoid true exact-project-package exact-project-package
+    else
+        add_check resource_plasmoid false exact-project-package missing-or-modified
+    fi
+fi
+if [[ $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    installed_workspaces="$TARGET_HOME/.local/share/plasma/plasmoids/org.kde.minimalist.workspaces"
+    source_workspaces="$REPO_ROOT/plasmoids/org.kde.minimalist.workspaces"
+    if [[ -d $installed_workspaces && ! -L $installed_workspaces ]] \
+        && diff -qr -- "$source_workspaces" "$installed_workspaces" >/dev/null 2>&1; then
+        add_check workspace_plasmoid true exact-project-package exact-project-package
+    else
+        add_check workspace_plasmoid false exact-project-package missing-or-modified
+    fi
+fi
+if [[ $PANEL_TARGET == minimalist-v04 || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    installed_layout="$TARGET_HOME/.local/share/plasma/layout-templates/org.kde.minimalist-v04"
+    source_layout="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v04"
+    if [[ -d $installed_layout && ! -L $installed_layout ]] \
+        && diff -qr -- "$source_layout" "$installed_layout" >/dev/null 2>&1; then
+        add_check layout_template true exact-project-package exact-project-package
+    else
+        add_check layout_template false exact-project-package missing-or-modified
+    fi
+
+    source_fastfetch="$REPO_ROOT/config/fastfetch/config.jsonc"
+    installed_fastfetch="$TARGET_HOME/.config/fastfetch/config.jsonc"
+    if [[ -f $source_fastfetch && ! -L $source_fastfetch \
+        && -f $installed_fastfetch && ! -L $installed_fastfetch ]] \
+        && diff -q -- "$source_fastfetch" "$installed_fastfetch" >/dev/null 2>&1; then
+        add_check fastfetch_config true exact-project-config exact-project-config
+    else
+        add_check fastfetch_config false exact-project-config missing-or-modified
+    fi
+    if command -v fastfetch >/dev/null 2>&1 \
+        && [[ -f $installed_fastfetch && ! -L $installed_fastfetch ]] \
+        && HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" \
+            fastfetch --config "$installed_fastfetch" >/dev/null 2>&1; then
+        add_check fastfetch_render true successful successful
+    elif command -v fastfetch >/dev/null 2>&1; then
+        add_check fastfetch_render false successful config-rejected
+    else
+        add_check fastfetch_render false successful command-missing
+    fi
+fi
+
+panel_raw=$("$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+    org.kde.PlasmaShell.evaluateScript "$(< "$PANEL_PROBE")" 2>&1)
+panel_status=$?
+if ((panel_status != 0)); then
+    printf 'error: running plasmashell could not be queried read-only\n' >&2
+    exit 2
+fi
+panel_raw=$(normalize_plasma_probe_output "$panel_raw")
+panel_json=$(printf '%s\n' "$panel_raw" | sed -n 's/^KDE_RICE_PANEL_STATE_JSON=//p' | tail -n 1)
+panel_marker=$(printf '%s\n' "$panel_raw" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q;}')
+[[ -n $panel_json && -n $panel_marker ]] || {
+    printf 'error: plasmashell returned an unrecognized verification result\n' >&2
+    exit 2
+}
+
+panel_count=$(marker_field "$panel_marker" panelCount) || exit 2
+signature=$(marker_field "$panel_marker" signature) || exit 2
+order_valid=$(marker_field "$panel_marker" orderValid) || exit 2
+geometry=$(marker_field "$panel_marker" geometryOk) || exit 2
+spacer=$(marker_field "$panel_marker" spacerOk) || exit 2
+title=$(marker_field "$panel_marker" activeTitleOk) || exit 2
+resource=$(marker_field "$panel_marker" resourceOk || printf false)
+task_manager=$(marker_field "$panel_marker" taskManagerOk || printf false)
+tray=$(marker_field "$panel_marker" trayOk) || exit 2
+clock=$(marker_field "$panel_marker" clockOk) || exit 2
+no_duplicates=$(marker_field "$panel_marker" noDuplicateTargetWidgets) || exit 2
+known_target_widgets=$(marker_field "$panel_marker" knownTargetWidgets) || exit 2
+known_built_in_widgets=$(marker_field "$panel_marker" knownBuiltInWidgets) || exit 2
+icon_tasks_known=$(marker_field "$panel_marker" iconTasksKnown || printf false)
+pager_known=$(marker_field "$panel_marker" pagerKnown || printf false)
+workspace_switcher_known=$(marker_field "$panel_marker" workspaceSwitcherKnown || printf false)
+spacer_count=$(marker_field "$panel_marker" spacerCount || printf none)
+spacer_actual=$(marker_field "$panel_marker" spacerExpanding) || exit 2
+title_actual=$(marker_field "$panel_marker" activeTitleRevision) || exit 2
+resource_actual=$(marker_field "$panel_marker" resourceRevision || printf none)
+task_fill=$(marker_field "$panel_marker" taskManagerFill || printf none)
+task_max_stripes=$(marker_field "$panel_marker" taskManagerMaxStripes || printf none)
+task_icon_spacing=$(marker_field "$panel_marker" taskManagerIconSpacing || printf none)
+pager=$(marker_field "$panel_marker" pagerOk || printf false)
+pager_displayed=$(marker_field "$panel_marker" pagerDisplayedText || printf none)
+pager_outlines=$(marker_field "$panel_marker" pagerShowWindowOutlines || printf none)
+pager_icons=$(marker_field "$panel_marker" pagerShowWindowIcons || printf none)
+workspace_switcher=$(marker_field "$panel_marker" workspaceSwitcherOk || printf false)
+workspace_switcher_revision=$(marker_field "$panel_marker" workspaceSwitcherRevision || printf none)
+widgets=$(marker_field "$panel_marker" widgetTypes) || exit 2
+geometry_actual=$(marker_field "$panel_marker" geometry) || exit 2
+[[ $panel_count == 1 ]] && one_panel=true || one_panel=false
+[[ $signature == "$PANEL_TARGET" && $order_valid == true ]] && topology=true || topology=false
+add_check panel_count "$one_panel" 1 "$panel_count"
+add_check panel_topology "$topology" "$PANEL_TARGET" "$signature:$widgets"
+add_check panel_geometry "$geometry" screen0/top/horizontal/32/opaque/fill "$geometry_actual"
+if [[ $PANEL_TARGET == minimalist-v04 || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    [[ $spacer == true && $spacer_count == 2 ]] && spacer_policy=true || spacer_policy=false
+    add_check flexible_spacers "$spacer_policy" two-expanding "$spacer_count:$spacer_actual"
+else
+    add_check flexible_spacer "$spacer" expanding "$spacer_actual"
+fi
+add_check active_title_policy "$title" packageRevision=1 "$title_actual"
+if [[ $PANEL_TARGET == minimalist-v03 || $PANEL_TARGET == minimalist-v04 \
+    || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    add_check resource_policy "$resource" packageRevision=2 "$resource_actual"
+fi
+if [[ $PANEL_TARGET == minimalist-v04 || $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    add_check task_manager_policy "$task_manager" compact-native \
+        "fill=$task_fill,maxStripes=$task_max_stripes,iconSpacing=$task_icon_spacing,launchers=user-owned"
+fi
+add_check tray_policy "$tray" "$PANEL_TARGET" "$tray"
+add_check clock_policy "$clock" "$PANEL_TARGET" "$clock"
+if [[ $PANEL_TARGET == minimalist-v04-pager ]]; then
+    add_check pager_policy "$pager" "numbers/no-window-outlines/no-window-icons" \
+        "displayedText=$pager_displayed,outlines=$pager_outlines,icons=$pager_icons"
+fi
+if [[ $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    add_check workspace_switcher_policy "$workspace_switcher" packageRevision=2 \
+        "$workspace_switcher_revision"
+fi
+add_check no_duplicate_widgets "$no_duplicates" true "$no_duplicates"
+if [[ $known_target_widgets == true && $known_built_in_widgets == true \
+    && ( $PANEL_TARGET != minimalist-v04 && $PANEL_TARGET != minimalist-v04-pager \
+        && $PANEL_TARGET != minimalist-v04-workspaces \
+        || $icon_tasks_known == true ) \
+    && ( $PANEL_TARGET != minimalist-v04-pager || $pager_known == true ) \
+    && ( $PANEL_TARGET != minimalist-v04-workspaces || $workspace_switcher_known == true ) ]]; then
+    live_widgets=true
+else
+    live_widgets=false
+fi
+add_check required_live_widgets "$live_widgets" available \
+    "target=$known_target_widgets built-ins=$known_built_in_widgets icon-tasks=$icon_tasks_known pager=$pager_known workspaces=$workspace_switcher_known"
+
+if [[ $PANEL_TARGET == minimalist-v04-pager \
+    || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        printf 'error: jq is required to verify KWin virtual desktops\n' >&2
+        exit 2
+    fi
+    KWIN_BUSCTL=${KDE_RICE_KWIN_BUSCTL:-}
+    if [[ -z $KWIN_BUSCTL ]]; then
+        KWIN_BUSCTL=$(command -v busctl 2>/dev/null || true)
+    elif [[ ! -x $KWIN_BUSCTL ]]; then
+        printf 'error: KWin busctl override is not executable\n' >&2
+        exit 2
+    fi
+    [[ -n $KWIN_BUSCTL ]] || {
+        printf 'error: busctl is required to verify KWin virtual desktops\n' >&2
+        exit 2
+    }
+    kwin_count_json=$($KWIN_BUSCTL --user --json=short get-property org.kde.KWin \
+        /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager count 2>/dev/null) || {
+        printf 'error: KWin virtual-desktop count could not be queried\n' >&2
+        exit 2
+    }
+    kwin_rows_json=$($KWIN_BUSCTL --user --json=short get-property org.kde.KWin \
+        /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager rows 2>/dev/null) || {
+        printf 'error: KWin virtual-desktop rows could not be queried\n' >&2
+        exit 2
+    }
+    kwin_count=$(printf '%s\n' "$kwin_count_json" | jq -er \
+        '.data | if type == "array" then .[0] else . end | select(type == "number")' 2>/dev/null) || {
+        printf 'error: KWin virtual-desktop count reply was malformed\n' >&2
+        exit 2
+    }
+    kwin_rows=$(printf '%s\n' "$kwin_rows_json" | jq -er \
+        '.data | if type == "array" then .[0] else . end | select(type == "number")' 2>/dev/null) || {
+        printf 'error: KWin virtual-desktop rows reply was malformed\n' >&2
+        exit 2
+    }
+    [[ $kwin_count == 4 ]] && desktops_ok=true || desktops_ok=false
+    [[ $kwin_rows == 1 ]] && rows_ok=true || rows_ok=false
+    add_check virtual_desktop_count "$desktops_ok" 4 "$kwin_count"
+    add_check virtual_desktop_rows "$rows_ok" 1 "$kwin_rows"
+fi
+
+if [[ -z $RECEIPT && $RESUME_RECEIPT == false ]]; then
+    latest_link="$TARGET_HOME/.local/state/kde-rice/bootstrap/latest"
+    [[ -L $latest_link ]] && RECEIPT=$(realpath -e -- "$latest_link" 2>/dev/null || true)
+fi
+if [[ -z $RECEIPT ]]; then
+    printf 'error: no successful bootstrap receipt is available for display-state verification\n' >&2
+    exit 2
+else
+    [[ $RECEIPT == /* && -d $RECEIPT ]] || {
+        printf 'error: receipt is not an existing absolute directory: %s\n' "$RECEIPT" >&2
+        exit 2
+    }
+    RECEIPT=$(realpath -e -- "$RECEIPT") || exit 2
+    receipt_guard_error=
+    if ! receipt_guard_error=$(assert_parent_within_home "$TARGET_HOME" \
+        ".local/state/kde-rice/bootstrap/receipt-check" 2>&1); then
+        printf '%s\n' "$receipt_guard_error" >&2
+        exit 2
+    fi
+    receipt_root=$(realpath -m -- "$TARGET_HOME/.local/state/kde-rice/bootstrap") || exit 2
+    case "$RECEIPT" in
+        "$receipt_root"/*) ;;
+        *)
+            printf 'error: receipt is outside the current home bootstrap state root: %s\n' "$RECEIPT" >&2
+            exit 2
+            ;;
+    esac
+    current_display=$(display_state_lines "$TARGET_HOME") || exit 2
+    if $RESUME_RECEIPT; then
+        [[ -f $RECEIPT/failed && ! -L $RECEIPT/failed \
+            && ! -e $RECEIPT/complete && ! -L $RECEIPT/complete \
+            && -f $RECEIPT/display-state.before.tsv \
+            && ! -L $RECEIPT/display-state.before.tsv \
+            && -r $RECEIPT/display-state.before.tsv ]] || {
+            printf 'error: receipt is not a resumable failed bootstrap transaction: %s\n' "$RECEIPT" >&2
+            exit 2
+        }
+        before_display=$(< "$RECEIPT/display-state.before.tsv") || exit 2
+        if [[ $current_display == "$before_display" ]]; then
+            display_ok=true
+            display_actual="failed-receipt baseline=current"
+        else
+            display_ok=false
+            display_actual="differs from failed-receipt baseline"
+        fi
+    else
+        [[ ! -e $RECEIPT/failed && ! -L $RECEIPT/failed ]] || {
+            printf 'error: bootstrap receipt records a failed transaction: %s\n' "$RECEIPT" >&2
+            exit 2
+        }
+        receipt_lifecycle_ok=false
+        if [[ -f $RECEIPT/complete && ! -L $RECEIPT/complete \
+            && $(< "$RECEIPT/complete") == complete ]]; then
+            receipt_lifecycle_ok=true
+        elif [[ -f $RECEIPT/verification-ready && ! -L $RECEIPT/verification-ready \
+            && $(< "$RECEIPT/verification-ready") == ready \
+            && ${KDE_RICE_TRANSACTION_RECEIPT:-} == "$RECEIPT" ]]; then
+            receipt_lifecycle_ok=true
+        fi
+        [[ $receipt_lifecycle_ok == true \
+            && -f $RECEIPT/display-state.before.tsv && ! -L $RECEIPT/display-state.before.tsv \
+            && -r $RECEIPT/display-state.before.tsv \
+            && -f $RECEIPT/display-state.after.tsv && ! -L $RECEIPT/display-state.after.tsv \
+            && -r $RECEIPT/display-state.after.tsv ]] || {
+            printf 'error: bootstrap receipt is incomplete: %s\n' "$RECEIPT" >&2
+            exit 2
+        }
+        before_display=$(< "$RECEIPT/display-state.before.tsv") || exit 2
+        expected_display=$(< "$RECEIPT/display-state.after.tsv") || exit 2
+        if [[ $before_display != "$expected_display" ]]; then
+            display_ok=false
+            display_actual="bootstrap changed excluded display fingerprint"
+        elif [[ $current_display == "$expected_display" ]]; then
+            display_ok=true
+            display_actual="before=after=current"
+        else
+            display_ok=false
+            display_actual="differs from bootstrap receipt"
+        fi
+    fi
+    if [[ -e $RECEIPT/panel-target || -L $RECEIPT/panel-target ]]; then
+        [[ -f $RECEIPT/panel-target && ! -L $RECEIPT/panel-target \
+            && -r $RECEIPT/panel-target ]] || {
+            printf 'error: bootstrap receipt panel target is unsafe: %s\n' "$RECEIPT" >&2
+            exit 2
+        }
+        receipt_panel_target=$(< "$RECEIPT/panel-target")
+        receipt_expected_target=$PANEL_TARGET
+        [[ $receipt_panel_target == "$receipt_expected_target" ]] && receipt_target_ok=true || receipt_target_ok=false
+        add_check receipt_panel_target "$receipt_target_ok" "$receipt_expected_target" "$receipt_panel_target"
+    fi
+fi
+add_check display_configuration_unchanged "$display_ok" "bootstrap fingerprint" "$display_actual"
+
+overall=true
+for ok in "${check_ok[@]}"; do
+    [[ $ok == true ]] || overall=false
+done
+
+json_escape() {
+    local value=$1
+    local character
+    local ordinal
+    local index
+    local LC_ALL=C
+
+    for ((index = 0; index < ${#value}; ++index)); do
+        character=${value:index:1}
+        case "$character" in
+            '"') printf '\\"' ;;
+            '\\') printf '\\\\' ;;
+            $'\b') printf '\\b' ;;
+            $'\f') printf '\\f' ;;
+            $'\n') printf '\\n' ;;
+            $'\r') printf '\\r' ;;
+            $'\t') printf '\\t' ;;
+            *)
+                printf -v ordinal '%d' "'$character"
+                if ((ordinal < 32)); then
+                    printf '\\u%04x' "$ordinal"
+                else
+                    printf '%s' "$character"
+                fi
+                ;;
+        esac
+    done
+}
+
+if $JSON; then
+    printf '{"schema_version":1,"status":"%s","checks":[' "$($overall && printf verified || printf mismatch)"
+    for index in "${!check_names[@]}"; do
+        ((index == 0)) || printf ','
+        printf '{"name":"%s","ok":%s,"expected":"%s","actual":"%s"}' \
+            "$(json_escape "${check_names[$index]}")" "${check_ok[$index]}" \
+            "$(json_escape "${check_expected[$index]}")" "$(json_escape "${check_actual[$index]}")"
+    done
+    printf ']}\n'
+else
+    case "$PANEL_TARGET" in
+        minimalist-v04-workspaces) target_label='Minimalist v0.4.1 Workspaces preview' ;;
+        minimalist-v04-pager) target_label='Minimalist v0.4.1 Pager preview' ;;
+        minimalist-v04) target_label='Minimalist v0.4.1' ;;
+        minimalist-v03) target_label='Minimalist v0.3' ;;
+        *) target_label='Minimalist v0.2 migration' ;;
+    esac
+    printf '%s verification: %s\n' "$target_label" "$($overall && printf VERIFIED || printf MISMATCH)"
+    for index in "${!check_names[@]}"; do
+        printf '%-5s %-34s expected=%s actual=%s\n' \
+            "$([[ ${check_ok[$index]} == true ]] && printf PASS || printf FAIL)" \
+            "${check_names[$index]}" "${check_expected[$index]}" "${check_actual[$index]}"
+    done
+    printf 'Read-only: no Plasma, KWin, Konsole, panel, or display setting was written.\n'
+fi
+
+$overall && exit 0
+exit 1

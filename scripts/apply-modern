@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+TARGET_HOME=${HOME:-}
+APPLY=false
+PLASMA_TARGET=default
+DECORATION_TARGET=Breeze
+KWIN_APPLY_TOOL=${KDE_RICE_KWIN_DECORATION_TOOL:-}
+
+if [[ -v KDE_RICE_KWIN_DECORATION_TOOL && ${KDE_RICE_TEST_MODE:-0} != 1 ]]; then
+    printf 'error: KDE_RICE_KWIN_DECORATION_TOOL is an isolated-test seam only\n' >&2
+    exit 1
+fi
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-modern [OPTIONS]
+
+Preview or activate the Minimalist KDE shell chrome. Preview is the default.
+Wallpaper, application colors, Konsole profile, and panel geometry are
+preserved; only Plasma Style and KWin decoration are switched to Breeze.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Capture a baseline and activate the modern shell
+  --dry-run             Explicitly select preview mode (default)
+  -h, --help            Show this help
+
+Live activation is allowed only for the current user's home. This command
+does not restart Plasma or KWin and never reads or writes display settings.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+require_command awk
+require_command date
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+
+read_kconfig_value() {
+    local file=$1
+    local group=$2
+    local key=$3
+
+    [[ -f $file ]] || return 0
+    awk -v wanted_group="[$group]" -v wanted_key="$key" '
+        $0 == wanted_group { in_group = 1; next }
+        /^\[/ { in_group = 0 }
+        in_group && index($0, wanted_key "=") == 1 {
+            print substr($0, length(wanted_key) + 2)
+            exit
+        }
+    ' "$file"
+}
+
+resolve_kwin_decoration_tool() {
+    local candidate
+    local resolved
+    local -a candidates=()
+
+    if [[ -n $KWIN_APPLY_TOOL ]]; then
+        candidates+=("$KWIN_APPLY_TOOL")
+    fi
+    candidates+=(
+        kwin-applywindowdecoration
+        /usr/lib/kwin-applywindowdecoration
+        /usr/lib64/kwin-applywindowdecoration
+        /usr/libexec/kwin-applywindowdecoration
+        /usr/libexec/kf6/kwin-applywindowdecoration
+        /usr/lib/qt6/libexec/kwin-applywindowdecoration
+        /usr/lib64/qt6/libexec/kwin-applywindowdecoration
+        /usr/lib/x86_64-linux-gnu/libexec/kwin-applywindowdecoration
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [[ $candidate == */* ]]; then
+            [[ -x $candidate ]] || continue
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        resolved=$(command -v -- "$candidate" 2>/dev/null) || continue
+        [[ -x $resolved ]] || continue
+        printf '%s\n' "$resolved"
+        return 0
+    done
+    return 1
+}
+
+plasma_current=$(read_kconfig_value "$TARGET_HOME/.config/plasmarc" Theme name)
+kwin_library=$(read_kconfig_value "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 library)
+kwin_theme=$(read_kconfig_value "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 theme)
+
+printf 'Modern shell mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf 'Current Plasma Style: %s\n' "${plasma_current:-Breeze (default)}"
+printf 'Current KWin decoration: library=%s theme=%s\n' "${kwin_library:-org.kde.breeze (default)}" "${kwin_theme:-Breeze (default)}"
+printf 'Target Plasma Style: Breeze (%s)\n' "$PLASMA_TARGET"
+printf 'Target KWin decoration: %s\n' "$DECORATION_TARGET"
+printf 'Preserve: wallpaper, colors, Konsole, panel geometry/widgets, and KWin tiling.\n'
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot or KDE setting was written.\n'
+    exit 0
+fi
+
+require_current_desktop_home "$TARGET_HOME"
+require_command plasma-apply-desktoptheme
+KWIN_APPLY_TOOL=$(resolve_kwin_decoration_tool) \
+    || die "KWin decoration apply capability is unavailable"
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$timestamp-modern-shell-$$"
+
+printf '\nCapturing pre-apply snapshot...\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+apply_error() {
+    local status=$?
+    warn "modern shell apply stopped after an error; Plasma and KWin were not restarted"
+    warn "rollback preview: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME"
+    warn "rollback apply: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME --apply"
+    exit "$status"
+}
+trap apply_error ERR
+
+printf '\nActivating Breeze Plasma Style...\n'
+plasma_result=$(plasma-apply-desktoptheme "$PLASMA_TARGET" 2>&1)
+printf '%s\n' "$plasma_result"
+
+printf '\nActivating Breeze window decoration...\n'
+decoration_result=$("$KWIN_APPLY_TOOL" "$DECORATION_TARGET" 2>&1)
+printf '%s\n' "$decoration_result"
+
+plasma_active=$(read_kconfig_value "$TARGET_HOME/.config/plasmarc" Theme name)
+kwin_library_active=$(read_kconfig_value "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 library)
+kwin_theme_active=$(read_kconfig_value "$TARGET_HOME/.config/kwinrc" org.kde.kdecoration2 theme)
+plasma_active=${plasma_active:-default}
+kwin_library_active=${kwin_library_active:-org.kde.breeze}
+kwin_theme_active=${kwin_theme_active:-Breeze}
+[[ $plasma_active == "$PLASMA_TARGET" ]] || die "Plasma did not record the Breeze theme"
+[[ $kwin_library_active == org.kde.breeze ]] || die "KWin did not record the Breeze decoration library"
+[[ $kwin_theme_active == "$DECORATION_TARGET" ]] || die "KWin did not record the Breeze decoration"
+
+trap - ERR
+printf '\nModern shell apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s/restore --backup %s --home %s\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+printf 'Restore apply: %s/restore --backup %s --home %s --apply\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+printf 'Plasma and KWin were updated through their supported live apply tools; neither was restarted.\n'
+printf 'Unrelated user assets were preserved. Display configuration was untouched.\n'

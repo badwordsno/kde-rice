@@ -1,0 +1,9 @@
+{
+    "KPackageStructure": "Plasma/LayoutTemplate",
+    "KPlugin": {
+        "Description": "Apply the guarded Minimalist v0.2 intermediate status strip",
+        "Id": "org.kde.minimalist-v02",
+        "License": "MIT",
+        "Name": "Minimalist v0.2 Status Strip"
+    }
+}

@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+WORKSPACE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.workspaces"
+WORKSPACE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.workspaces"
+PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-workspaces-preview [OPTIONS]
+
+Preview or apply the compact Minimalist Workspaces switcher. The guarded
+apply replaces the one built-in Pager after the launcher with one project
+Plasmoid. The four-desktop, one-row KWin topology is preserved unchanged.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot and apply the Workspaces preview
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded apply
+  -h, --help            Show this help
+
+Only the exact 32px Minimalist v0.4.1 Pager source or a known Workspaces
+revision is accepted. Plasma and KWin are never restarted.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+for command_name in realpath cp date mv mkdir diff sleep jq rg; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_KWIN_BUSCTL \
+    || -v KDE_RICE_QML_IMPORT_ROOT ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal Workspaces-preview overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; Workspaces preview is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+KWIN_BUSCTL=${KDE_RICE_KWIN_BUSCTL:-}
+if [[ -z $KWIN_BUSCTL ]]; then
+    KWIN_BUSCTL=$(command -v busctl 2>/dev/null || true)
+fi
+[[ -n $KWIN_BUSCTL && -x $KWIN_BUSCTL ]] \
+    || die "busctl is required for guarded KWin API checks"
+
+qml_import_root=${KDE_RICE_QML_IMPORT_ROOT:-}
+if [[ -z $qml_import_root ]] && command -v qtpaths6 >/dev/null 2>&1; then
+    qml_import_root=$(qtpaths6 --query QT_INSTALL_QML 2>/dev/null || true)
+fi
+if [[ -z $qml_import_root ]]; then
+    for candidate in /usr/lib64/qt6/qml /usr/lib/qt6/qml; do
+        if [[ -d $candidate ]]; then
+            qml_import_root=$candidate
+            break
+        fi
+    done
+fi
+[[ $qml_import_root == /* && -d $qml_import_root ]] \
+    || die "Qt 6 QML import root could not be resolved"
+dbus_qmltypes="$qml_import_root/org/kde/plasma/workspace/dbus/dbusplugin.qmltypes"
+taskmanager_qmltypes="$qml_import_root/org/kde/taskmanager/taskmanager.qmltypes"
+[[ -f $dbus_qmltypes && -f $taskmanager_qmltypes ]] \
+    || die "required Plasma Workspaces QML modules are unavailable"
+rg -q 'exports: \["org.kde.plasma.workspace.dbus/SessionBus 1.0"\]' "$dbus_qmltypes" \
+    || die "Plasma SessionBus QML API is unavailable"
+rg -q 'exports: \["org.kde.taskmanager/VirtualDesktopInfo 0.0"\]' "$taskmanager_qmltypes" \
+    || die "TaskManager VirtualDesktopInfo QML API is unavailable"
+kwin_api=$($KWIN_BUSCTL --user introspect org.kde.KWin /KWin org.kde.KWin 2>/dev/null) \
+    || die "KWin D-Bus API could not be introspected"
+printf '%s\n' "$kwin_api" | rg -q 'nextDesktop[[:space:]]+method[[:space:]]+-[[:space:]]+-' \
+    || die "KWin nextDesktop() API is unavailable"
+printf '%s\n' "$kwin_api" | rg -q 'previousDesktop[[:space:]]+method[[:space:]]+-[[:space:]]+-' \
+    || die "KWin previousDesktop() API is unavailable"
+
+load_managed_paths "$MANIFEST"
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$WORKSPACE_TARGET_RELATIVE" "$PANEL_CONFIG_RELATIVE"; do
+    validate_relative_path "$target_relative" || die "unsafe Workspaces-preview target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] \
+        || die "Workspaces-preview target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+
+layout_source="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+workspace_source="$REPO_ROOT/$WORKSPACE_SOURCE_RELATIVE"
+workspace_destination="$TARGET_HOME/$WORKSPACE_TARGET_RELATIVE"
+[[ -d $layout_source && ! -L $layout_source ]] \
+    || die "v0.4.1 layout source is missing or unsafe"
+[[ -d $workspace_source && ! -L $workspace_source ]] \
+    || die "Minimalist Workspaces source is missing or unsafe"
+for source_file in workspaces-preflight.js workspaces-layout.js \
+    workspaces-postcheck.js workspaces-cleanup.js workspaces-refresh-restore.js; do
+    [[ -f $layout_source/contents/$source_file && ! -L $layout_source/contents/$source_file ]] \
+        || die "Workspaces-preview source is incomplete: $source_file"
+done
+for source_file in metadata.json contents/ui/main.qml; do
+    [[ -f $workspace_source/$source_file && ! -L $workspace_source/$source_file ]] \
+        || die "Minimalist Workspaces package is incomplete: $source_file"
+done
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+kwin_property_json() {
+    "$KWIN_BUSCTL" --user --json=short get-property org.kde.KWin \
+        /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager "$1"
+}
+
+json_scalar_number() {
+    jq -er '.data | if type == "array" then .[0] else . end | select(type == "number")'
+}
+
+read_kwin_state() {
+    KWIN_COUNT=$(kwin_property_json count | json_scalar_number) \
+        || die "KWin virtual-desktop count reply is unavailable or malformed"
+    KWIN_ROWS=$(kwin_property_json rows | json_scalar_number) \
+        || die "KWin virtual-desktop row reply is unavailable or malformed"
+}
+
+marker_field() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+printf 'Minimalist Workspaces preview mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\n1. Current topology and capability state (read-only)\n'
+preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/workspaces-preflight.js")")
+printf '%s\n' "$preflight"
+[[ $preflight == *MINIMALIST_WORKSPACES_PREFLIGHT_OK* \
+    && $preflight == *" height=32 "* \
+    && $preflight == *" geometryOk=true "* \
+    && $preflight == *" anchorReady=true "* \
+    && $preflight == *" pagerKnown=true "* ]] \
+    || die "Workspaces preview requires the exact 32px Pager source or Workspaces target"
+if [[ $preflight == *" topology=minimalist-v04-pager "* ]]; then
+    initial_topology=minimalist-v04-pager
+elif [[ $preflight == *" topology=minimalist-v04-workspaces "* ]]; then
+    initial_topology=minimalist-v04-workspaces
+else
+    die "Workspaces preview preflight returned an unknown topology"
+fi
+initial_workspace_revision=$(marker_field "$preflight" workspaceRevision) \
+    || die "Workspaces preview preflight omitted the live package revision"
+if [[ $initial_topology == minimalist-v04-pager ]]; then
+    [[ $initial_workspace_revision == none ]] \
+        || die "Pager source reported an unexpected Workspaces revision"
+else
+    case "$initial_workspace_revision" in
+        1 | 2) ;;
+        *) die "unsupported live Workspaces package revision: $initial_workspace_revision" ;;
+    esac
+fi
+read_kwin_state
+[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+    || die "Workspaces preview requires exactly four KWin desktops in one row"
+printf 'KWin virtual desktops: count=%s rows=%s\n' "$KWIN_COUNT" "$KWIN_ROWS"
+printf 'Confirmed APIs: VirtualDesktopInfo state; Plasma SessionBus; KWin nextDesktop()/previousDesktop()\n'
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-workspaces-preview-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\n2. Complete change plan\n'
+printf '  current accepted topology: %s on one screen-0 top panel at 32 logical px\n' "$initial_topology"
+printf '  current KWin topology: four virtual desktops in one horizontal row\n'
+printf '  managed asset write: %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
+printf '  managed asset refresh: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+if [[ $initial_topology == minimalist-v04-pager ]]; then
+    printf '  panel removal: exactly one built-in org.kde.plasma.pager after the launcher\n'
+    printf '  panel addition: exactly one org.kde.minimalist.workspaces at the same launcher anchor\n'
+elif [[ $initial_workspace_revision == 1 ]]; then
+    printf '  panel removal: exactly one revision-1 org.kde.minimalist.workspaces after the launcher\n'
+    printf '  panel addition: exactly one revision-2 org.kde.minimalist.workspaces at the same launcher anchor\n'
+else
+    printf '  panel removals/additions: none (the exact Workspaces target already exists)\n'
+fi
+printf '  Workspaces policy write: General/packageRevision=2\n'
+printf '  click behavior: reach buttons 1-4 through the confirmed no-argument KWin next/previous desktop APIs\n'
+printf '  KWin changes: none; desktop count, row layout, IDs, names, and current desktop are preserved\n'
+printf '  existing widget moves/resizes: none; panel remains 32 logical px\n'
+printf '  preserve: task launchers, wallpaper, shortcuts, clock, resource widget, tray, and display modes\n'
+printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
+printf '  snapshot destination: %s\n' "$snapshot_path"
+if [[ $initial_topology == minimalist-v04-pager ]]; then
+    printf '  automatic failure rollback: restore the stock numbered Pager live, then restore the complete snapshot\n'
+elif [[ $initial_workspace_revision == 1 ]]; then
+    printf '  automatic failure rollback: restore the complete snapshot, then reload its revision-1 Workspaces package live\n'
+else
+    printf '  automatic failure rollback: restore the complete snapshot; no widget instance was replaced\n'
+fi
+printf '  later manual rollback preview: %s\n' "$restore_preview"
+printf '  later manual rollback apply: %s (then log out/in so Plasma reloads restored live state)\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, package, panel, Pager, virtual desktop, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n3. Capturing the complete managed scope before the first write\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+workspace_write_attempted=false
+apply_error() {
+    local status=$?
+    local cleanup_result=
+    local cleanup_source="$layout_source/contents/workspaces-cleanup.js"
+    local refresh_restore_result=
+    local refresh_restore_source="$layout_source/contents/workspaces-refresh-restore.js"
+    local restore_status=0
+    trap - EXIT
+    set +e
+    warn "Workspaces preview stopped after an error; Plasma and KWin were not restarted"
+    if [[ -f $layout_destination/contents/workspaces-cleanup.js \
+        && ! -L $layout_destination/contents/workspaces-cleanup.js ]]; then
+        cleanup_source="$layout_destination/contents/workspaces-cleanup.js"
+    fi
+    if [[ $initial_topology == minimalist-v04-pager && $workspace_write_attempted == true ]]; then
+        cleanup_result=$(evaluate_plasma_script "$(< "$cleanup_source")" 2>&1)
+        if [[ $cleanup_result == *MINIMALIST_WORKSPACES_CLEANUP_OK* ]]; then
+            warn "the stock numbered Pager was restored on the live panel"
+        else
+            warn "live replacement cleanup could not prove a safe exact target; no unrelated widget was removed"
+        fi
+    fi
+    "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
+    restore_status=$?
+    if ((restore_status == 0)); then
+        warn "pre-apply managed files were restored automatically"
+        if [[ $initial_topology == minimalist-v04-workspaces \
+            && $initial_workspace_revision == 1 \
+            && $workspace_write_attempted == true ]]; then
+            refresh_restore_result=$(evaluate_plasma_script "$(< "$refresh_restore_source")" 2>&1)
+            if [[ $refresh_restore_result == *MINIMALIST_WORKSPACES_REFRESH_RESTORE_OK* ]]; then
+                warn "the restored revision-1 Workspaces package was reloaded on the live panel"
+            else
+                warn "the revision-1 live package reload could not prove a safe exact target; no unrelated widget was removed"
+            fi
+        fi
+    else
+        warn "automatic snapshot restore failed; use: $restore_apply"
+    fi
+    exit "$status"
+}
+trap apply_error EXIT
+
+install_managed_directory() {
+    local source=$1
+    local target_relative=$2
+    local destination="$TARGET_HOME/$target_relative"
+    local temporary="$destination.kde-rice-new-$$"
+    local current
+
+    current=$(path_type "$destination")
+    [[ $current != unsupported ]] || die "managed target has an unsupported type: $target_relative"
+    [[ ! -e $temporary && ! -L $temporary ]] \
+        || die "temporary install path already exists: $temporary"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source" "$temporary"
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced_path/$(dirname -- "$target_relative")"
+        mv -- "$destination" "$displaced_path/$target_relative"
+    fi
+    mv -- "$temporary" "$destination"
+    diff -qr -- "$source" "$destination" >/dev/null \
+        || die "installed managed directory differs from source: $target_relative"
+}
+
+printf '\n4. Installing the exact Workspaces package and refreshing the v0.4.1 layout asset\n'
+umask 077
+install_managed_directory "$workspace_source" "$WORKSPACE_TARGET_RELATIVE"
+install_managed_directory "$layout_source" "$LAYOUT_TARGET_RELATIVE"
+
+printf '\n5. Rechecking panel, package visibility, APIs, and KWin before the live write\n'
+write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-preflight.js")")
+printf '%s\n' "$write_preflight"
+[[ $write_preflight == *MINIMALIST_WORKSPACES_PREFLIGHT_OK* \
+    && $write_preflight == *" topology=$initial_topology "* \
+    && $write_preflight == *" workspaceRevision=$initial_workspace_revision "* \
+    && $write_preflight == *" workspaceKnown=true "* ]] \
+    || die "panel changed or the Workspaces package did not become available before the guarded write"
+read_kwin_state
+[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+    || die "KWin desktops changed before the guarded write"
+
+printf '\n6. Installing or refreshing the compact Workspaces Plasmoid\n'
+workspace_write_attempted=true
+layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-layout.js")")
+printf '%s\n' "$layout_result"
+[[ $layout_result == *MINIMALIST_WORKSPACES_LAYOUT_OK* ]] \
+    || die "Plasma did not confirm the Workspaces layout write"
+
+printf '\n7. Read-only Workspaces and KWin postcheck\n'
+post_result=
+for attempt in {1..20}; do
+    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-postcheck.js")")
+    [[ $post_result == *MINIMALIST_WORKSPACES_POSTCHECK_OK* ]] && break
+    ((attempt == 20)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_WORKSPACES_POSTCHECK_OK* ]] \
+    || die "live Workspaces topology or policy did not settle to the exact target"
+read_kwin_state
+[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+    || die "live KWin topology changed during the panel replacement"
+
+printf '\n8. Repository read-only verification\n'
+set +e
+verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
+    --panel-target minimalist-v04-workspaces --json 2>&1)
+verify_status=$?
+set -e
+printf '%s\n' "$verify_output"
+verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
+    '[.checks[] | select(.name != "display_configuration_unchanged" and .ok != true)] | length' \
+    2>/dev/null) || die "repository verification output was malformed"
+((verify_non_display_failures == 0)) \
+    || die "repository verification found an in-scope mismatch"
+if ((verify_status != 0)); then
+    warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
+fi
+
+trap - EXIT
+printf '\nMinimalist Workspaces preview apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced managed assets: %s\n' "$displaced_path"
+fi
+printf 'Result: four compact numbered desktop buttons after the launcher; active desktop uses the theme highlight.\n'
+printf 'No desktop topology, other widget, panel geometry, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'

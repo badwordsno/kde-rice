@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-clock-policy [OPTIONS]
+
+Preview or apply only the managed Digital Clock Appearance policy on an exact
+32px Minimalist v0.4.1 panel. Preview is the default. The apply refreshes the
+project-owned v0.4.1 layout template, then writes only eleven Appearance keys on
+the existing built-in Digital Clock.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Snapshot, refresh the layout asset, and set the clock
+  --dry-run             Explicitly select preview mode (default)
+  --allow-degraded      Permit an explicitly reviewed degraded apply
+  -h, --help            Show this help
+
+Every panel state other than the exact 32px Minimalist v0.4.1 target is refused
+before snapshot or mutation. No panel or widget is added, removed, moved, or
+resized, and resource/task/spacer settings are not written.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --allow-degraded)
+            ALLOW_DEGRADED=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+for command_name in realpath cp date mv mkdir diff sleep jq; do
+    require_command "$command_name"
+done
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal clock-policy overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+        fi
+        warn "doctor reported degraded compatibility"
+        ;;
+    2) die "doctor reported unsupported; clock-policy apply is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
+load_managed_paths "$MANIFEST"
+
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$PANEL_CONFIG_RELATIVE"; do
+    validate_relative_path "$target_relative" || die "unsafe clock-policy target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] \
+        || die "clock-policy target is not managed: $target_relative"
+    assert_parent_within_home "$TARGET_HOME" "$target_relative"
+done
+
+layout_source="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+[[ -d $layout_source && ! -L $layout_source ]] \
+    || die "v0.4.1 layout source is missing or unsafe"
+for source_file in clock-preflight.js clock-policy.js clock-postcheck.js; do
+    [[ -f $layout_source/contents/$source_file && ! -L $layout_source/contents/$source_file ]] \
+        || die "v0.4.1 clock-policy source is incomplete: $source_file"
+done
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+marker_field() {
+    local marker=$1
+    local wanted=$2
+    local token
+    local -a tokens
+
+    read -r -a tokens <<< "$marker"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            "$wanted"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+printf 'Minimalist clock policy mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf '\n1. Current topology (read-only)\n'
+preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/clock-preflight.js")")
+printf '%s\n' "$preflight"
+[[ $preflight == *MINIMALIST_CLOCK_PREFLIGHT_OK* \
+    && $preflight == *" height=32 "* \
+    && $preflight == *" geometryOk=true "* ]] \
+    || die "clock policy requires the exact 32px Minimalist v0.4.1 target"
+initial_topology=$(marker_field "$preflight" topology) \
+    || die "clock preflight omitted the exact panel topology"
+case "$initial_topology" in
+    minimalist-v04 | minimalist-v04-pager) ;;
+    minimalist-v04-workspaces)
+        workspace_revision=$(marker_field "$preflight" workspaceRevision) \
+            || die "clock preflight omitted the Workspaces package revision"
+        case "$workspace_revision" in
+            2) ;;
+            1)
+                $APPLY && die "clock apply requires Workspaces revision 2; apply the reviewed Workspaces refresh first"
+                warn "clock dry-run is planning the second step after the Workspaces revision-2 refresh"
+                ;;
+            *) die "clock policy requires a known Workspaces revision 1 or 2 target" ;;
+        esac
+        ;;
+    *) die "clock policy preflight returned an unknown topology" ;;
+esac
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-clock-policy-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+snapshot_prepared=false
+if $APPLY && [[ -n ${KDE_RICE_TRANSACTION_SNAPSHOT:-} \
+    || -n ${KDE_RICE_TRANSACTION_RECEIPT:-} ]]; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+    snapshot_prepared=true
+fi
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\n2. Complete change plan\n'
+printf '  current accepted topology: %s on one screen-0 top panel at 32 logical px\n' "$initial_topology"
+printf '  managed asset write: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed Plasma config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+printf '  clock target: preserve the existing org.kde.plasma.digitalclock instance\n'
+printf '  clock Appearance writes: showDate=false, showSeconds=2, use24hFormat=2, autoFontAndSize=false, fontFamily=Noto Sans, fontSize=11, fontStyleName=Regular, fontWeight=400\n'
+printf '  panel removals: none\n'
+printf '  panel additions: none\n'
+printf '  panel and widget geometry changes: none; panel remains 32 logical px\n'
+printf '  untouched widget policies: resources, both spacers, task manager, tray, input, title, and launcher\n'
+printf '  preserve: widget instances/order, pinned applications, wallpaper, KWin, shortcuts, and display configuration\n'
+printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
+printf '  snapshot destination: %s\n' "$snapshot_path"
+printf '  rollback preview: %s\n' "$restore_preview"
+printf '  rollback apply: %s\n' "$restore_apply"
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, layout asset, panel, widget, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n3. Capturing the complete managed scope before the first write\n'
+if ! $snapshot_prepared; then
+    capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+else
+    printf 'Transaction baseline was already validated before this component plan.\n'
+fi
+
+apply_error() {
+    local status=$?
+    local restore_status=0
+    trap - EXIT
+    set +e
+    warn "clock-policy apply stopped after an error; Plasma and KWin were not restarted"
+    warn "snapshot: $snapshot_path"
+    "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
+    restore_status=$?
+    if ((restore_status != 0)); then
+        warn "automatic snapshot restore failed"
+        warn "restore apply: $restore_apply"
+    else
+        warn "pre-apply managed files were restored automatically"
+        warn "if Plasma retained an in-memory partial clock value, log out before relying on the restored file"
+    fi
+    exit "$status"
+}
+trap apply_error EXIT
+
+printf '\n4. Refreshing only the exact v0.4.1 layout-template asset\n'
+umask 077
+temporary="$layout_destination.kde-rice-new-$$"
+current=$(path_type "$layout_destination")
+[[ $current != unsupported ]] || die "managed layout target has an unsupported type"
+[[ ! -e $temporary && ! -L $temporary ]] \
+    || die "temporary layout install path already exists: $temporary"
+mkdir -p -- "$(dirname -- "$layout_destination")"
+cp -a -- "$layout_source" "$temporary"
+if [[ $current != absent ]]; then
+    mkdir -p -- "$displaced_path/$(dirname -- "$LAYOUT_TARGET_RELATIVE")"
+    mv -- "$layout_destination" "$displaced_path/$LAYOUT_TARGET_RELATIVE"
+fi
+mv -- "$temporary" "$layout_destination"
+diff -qr -- "$layout_source" "$layout_destination" >/dev/null \
+    || die "installed v0.4.1 layout differs from its source"
+
+printf '\n5. Rechecking the exact topology before the clock-only write\n'
+write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/clock-preflight.js")")
+printf '%s\n' "$write_preflight"
+[[ $write_preflight == *MINIMALIST_CLOCK_PREFLIGHT_OK* \
+    && $write_preflight == *" topology=$initial_topology "* \
+    && $write_preflight == *" height=32 "* \
+    && $write_preflight == *" geometryOk=true "* ]] \
+    || die "panel changed before the guarded clock write"
+if [[ $initial_topology == minimalist-v04-workspaces \
+    && $write_preflight != *" workspaceRevision=2 "* ]]; then
+    die "Workspaces package revision changed before the guarded clock write"
+fi
+
+printf '\n6. Applying only the Digital Clock Appearance policy\n'
+result=$(evaluate_plasma_script "$(< "$layout_destination/contents/clock-policy.js")")
+printf '%s\n' "$result"
+[[ $result == *MINIMALIST_CLOCK_POLICY_OK* ]] \
+    || die "Plasma did not confirm the clock-only policy write"
+
+printf '\n7. Read-only clock-policy postcheck\n'
+post_result=
+for attempt in {1..10}; do
+    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/clock-postcheck.js")")
+    [[ $post_result == *MINIMALIST_CLOCK_POSTCHECK_OK* ]] && break
+    ((attempt == 10)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_CLOCK_POSTCHECK_OK* ]] \
+    || die "live clock policy or exact v0.4.1 guard no longer matches"
+
+printf '\n8. Repository read-only verification\n'
+set +e
+verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
+    --panel-target "$initial_topology" --json 2>&1)
+verify_status=$?
+set -e
+printf '%s\n' "$verify_output"
+verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
+    '[.checks[] | select(.name != "display_configuration_unchanged" and .ok != true)] | length' \
+    2>/dev/null) || die "repository verification output was malformed"
+((verify_non_display_failures == 0)) \
+    || die "repository verification found an in-scope mismatch"
+if ((verify_status != 0)); then
+    warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
+fi
+
+trap - EXIT
+printf '\nMinimalist clock policy apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s\n' "$restore_preview"
+printf 'Restore apply: %s\n' "$restore_apply"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced layout asset: %s\n' "$displaced_path"
+fi
+printf 'Only the v0.4.1 layout asset and the existing clock Appearance policy were changed.\n'
+printf 'No panel/widget instance, geometry, resource, spacer, task, shortcut, KWin, or display setting was changed.\n'

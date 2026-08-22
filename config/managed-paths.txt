@@ -1,0 +1,26 @@
+# kde-rice managed paths (current Minimalist v0.4 scope)
+#
+# Paths are relative to the target home directory. Globs, absolute paths, and
+# parent-directory traversal are intentionally unsupported.
+
+# KDE and Plasma configuration files that later phases may edit.
+.config/kdeglobals
+.config/kwinrc
+.config/kcminputrc
+.config/plasmarc
+.config/plasma-org.kde.plasma.desktop-appletsrc
+.config/plasmashellrc
+.config/konsolerc
+.config/fastfetch/config.jsonc
+
+# Project-owned user-local assets. These exact names avoid capturing unrelated
+# themes, profiles, or other user data from the parent directories.
+.local/share/color-schemes/BlackMinimal.colors
+.local/share/konsole/BlackMinimal.colorscheme
+.local/share/konsole/BlackMinimal.profile
+.local/share/plasma/layout-templates/org.kde.minimalist-v02
+.local/share/plasma/layout-templates/org.kde.minimalist-v03
+.local/share/plasma/layout-templates/org.kde.minimalist-v04
+.local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle
+.local/share/plasma/plasmoids/org.kde.minimalist.resources
+.local/share/plasma/plasmoids/org.kde.minimalist.workspaces

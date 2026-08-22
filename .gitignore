@@ -1,0 +1,9 @@
+/dist/
+*.tar.xz
+*.tar.xz.sha256
+SHA256SUMS
+
+# Transaction data belongs only in the target user's state directory.
+snapshots/
+receipts/
+restore-displaced/

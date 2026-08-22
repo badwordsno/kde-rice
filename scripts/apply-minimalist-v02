@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+APPLY=false
+INSTALL_ONLY=false
+LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v02"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v02"
+TITLE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.activewindowtitle"
+TITLE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.activewindowtitle"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/apply-minimalist-v02 [OPTIONS]
+
+Preview or apply the guarded Minimalist v0.2 intermediate status strip. Preview
+is the default. The v0.1 pager and icon tasks are replaced at this historical
+step by a compact active-window title and Plasma's built-in flexible spacer;
+global shortcuts remain user-owned and unchanged.
+
+Options:
+  --home ABSOLUTE_PATH  Target home directory (default: $HOME)
+  --apply               Capture a baseline, install, and activate the layout
+  --dry-run             Explicitly select preview mode (default)
+  --install-only        Install both packages without live Plasma changes
+  -h, --help            Show this help
+
+Live activation accepts only the approved v0.1 eight-widget strip, earlier v0.2
+strips, the current seven-widget target, or either exact interrupted-v0.2
+ordering on one horizontal top panel on screen 0.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --home)
+            (($# >= 2)) || die "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply)
+            APPLY=true
+            shift
+            ;;
+        --dry-run)
+            APPLY=false
+            shift
+            ;;
+        --install-only)
+            INSTALL_ONLY=true
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+require_command realpath
+require_command cp
+require_command date
+require_command mv
+refuse_root
+
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+load_managed_paths "$MANIFEST"
+
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do
+    managed[$relative]=1
+done
+
+layout_source_path="$REPO_ROOT/$LAYOUT_SOURCE_RELATIVE"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+title_source_path="$REPO_ROOT/$TITLE_SOURCE_RELATIVE"
+title_destination="$TARGET_HOME/$TITLE_TARGET_RELATIVE"
+
+validate_relative_path "$LAYOUT_TARGET_RELATIVE" || die "unsafe v0.2 target: $LAYOUT_TARGET_RELATIVE"
+validate_relative_path "$TITLE_TARGET_RELATIVE" || die "unsafe active-title target: $TITLE_TARGET_RELATIVE"
+[[ -n ${managed[$LAYOUT_TARGET_RELATIVE]+x} ]] || die "v0.2 target is not managed: $LAYOUT_TARGET_RELATIVE"
+[[ -n ${managed[$TITLE_TARGET_RELATIVE]+x} ]] || die "active-title target is not managed: $TITLE_TARGET_RELATIVE"
+[[ -d $layout_source_path && ! -L $layout_source_path ]] || die "v0.2 layout source is missing or unsafe"
+[[ -d $title_source_path && ! -L $title_source_path ]] || die "active-title source is missing or unsafe"
+[[ -f $layout_source_path/contents/layout.js
+    && -f $layout_source_path/contents/preflight.js
+    && -f $layout_source_path/contents/postcheck.js
+    && -f $layout_source_path/metadata.json ]] || die "v0.2 layout package is incomplete"
+[[ -f $title_source_path/contents/ui/main.qml
+    && -f $title_source_path/metadata.json ]] || die "active-title package is incomplete"
+assert_parent_within_home "$TARGET_HOME" "$LAYOUT_TARGET_RELATIVE"
+assert_parent_within_home "$TARGET_HOME" "$TITLE_TARGET_RELATIVE"
+
+probe_script=$(< "$layout_source_path/contents/preflight.js")
+post_probe_script=$(< "$layout_source_path/contents/postcheck.js")
+
+if ! $INSTALL_ONLY; then
+    require_current_desktop_home "$TARGET_HOME"
+    DBUS_TOOL=$(resolve_dbus_tool) || die "qdbus6 or a compatible Qt D-Bus tool is required"
+fi
+
+printf 'Minimalist v0.2 mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
+printf 'Target home: %s\n' "$TARGET_HOME"
+printf 'install %-48s -> %s\n' "$TITLE_SOURCE_RELATIVE" "$TITLE_TARGET_RELATIVE"
+printf 'install %-48s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+
+if ! $INSTALL_ONLY; then
+    printf '\nCurrent live panel:\n'
+    probe_result=$("$DBUS_TOOL" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$probe_script")
+    printf '%s\n' "$probe_result"
+    [[ $probe_result == *MINIMALIST_V02_PREFLIGHT_OK* ]] || die "live panel topology differs from the approved v0.1/v0.2 states"
+    printf '\nLegacy v0.2 intermediate: launcher | active title | flexible space | input/tray/time.\n'
+    printf 'Remove from panel: pager, icons-only task manager, and show-desktop.\n'
+    printf 'Clock target: date hidden; 24-hour time with seconds; automatic system font sizing.\n'
+    printf 'Preserve: global shortcuts, KWin, wallpaper, colors, and all display configuration.\n'
+fi
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, asset, widget, or panel setting was written.\n'
+    exit 0
+fi
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+apply_id="$timestamp-minimalist-v02-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
+displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+
+printf '\nCapturing pre-apply snapshot...\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
+
+apply_error() {
+    local status=$?
+    warn "Minimalist v0.2 apply stopped after an error; Plasma and KWin were not restarted"
+    warn "rollback preview: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME"
+    warn "rollback apply: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME --apply"
+    exit "$status"
+}
+trap apply_error ERR
+
+umask 077
+
+install_package() {
+    local source_path=$1
+    local destination=$2
+    local target_relative=$3
+    local temporary="$destination.kde-rice-new-$$"
+    local current
+
+    current=$(path_type "$destination")
+    [[ $current != unsupported ]] || die "managed target has an unsupported type: $target_relative"
+    [[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$source_path" "$temporary"
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$displaced_path/$(dirname -- "$target_relative")"
+        mv -- "$destination" "$displaced_path/$target_relative"
+    fi
+    mv -- "$temporary" "$destination"
+}
+
+install_package "$title_source_path" "$title_destination" "$TITLE_TARGET_RELATIVE"
+install_package "$layout_source_path" "$layout_destination" "$LAYOUT_TARGET_RELATIVE"
+
+if ! $INSTALL_ONLY; then
+    printf '\nActivating Minimalist v0.2 status strip...\n'
+    result=$("$DBUS_TOOL" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$(< "$layout_destination/contents/layout.js")")
+    printf '%s\n' "$result"
+    [[ $result == *MINIMALIST_V02_STATUS_STRIP_OK* ]] || die "Plasma did not confirm the v0.2 layout transition"
+
+    post_result=""
+    for attempt in {1..10}; do
+        post_result=$("$DBUS_TOOL" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$post_probe_script")
+        [[ $post_result == *MINIMALIST_V02_POSTCHECK_OK* ]] && break
+        ((attempt == 10)) || sleep 0.1
+    done
+    printf '%s\n' "$post_result"
+    [[ $post_result == *MINIMALIST_V02_POSTCHECK_OK* ]] || die "live v0.2 topology or status-strip policy did not match the target"
+fi
+
+trap - ERR
+printf '\nMinimalist v0.2 apply complete.\n'
+printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
+printf 'Restore preview: %s/restore --backup %s --home %s\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+printf 'Restore apply: %s/restore --backup %s --home %s --apply\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
+if [[ -d $displaced_path ]]; then
+    printf 'Replaced managed packages: %s\n' "$displaced_path"
+fi
+printf 'The pager, icons-only task manager, and show-desktop were removed only from this panel.\n'
+printf 'Their packages, applications, and window state were not removed.\n'
+printf 'Global shortcuts, KWin, wallpaper, colors, and display configuration were untouched.\n'

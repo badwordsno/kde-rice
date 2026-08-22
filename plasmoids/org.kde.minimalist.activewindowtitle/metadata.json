@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "kde-rice"
+            }
+        ],
+        "Category": "Windows and Tasks",
+        "Description": "Show the active window title as a compact panel text strip",
+        "EnabledByDefault": true,
+        "Icon": "preferences-system-windows",
+        "Id": "org.kde.minimalist.activewindowtitle",
+        "License": "MIT",
+        "Name": "Minimalist Active Window Title",
+        "Version": "2.1"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,45 @@
+{
+    "schemaVersion": 1,
+    "package": {
+        "id": "io.github.badwordsno.minimalistblack",
+        "structure": "Plasma/LookAndFeel",
+        "version": "1.0.0"
+    },
+    "scope": {
+        "mode": "appearance-only",
+        "components": [
+            "application-colors",
+            "widget-style",
+            "plasma-style",
+            "window-decoration"
+        ],
+        "excluded": [
+            "applets",
+            "cursors",
+            "desktop-layout",
+            "fonts",
+            "icons",
+            "scripts",
+            "splash",
+            "wallpaper"
+        ]
+    },
+    "compatibility": {
+        "breezeRequired": true,
+        "plasmaMajor": 6
+    },
+    "assets": {
+        "previewOrigin": "generated",
+        "privateAssetsIncluded": false,
+        "previews": {
+            "fullscreen": {
+                "path": "contents/previews/fullscreenpreview.jpg",
+                "sha256": "d84da71b84d0603457abf1e151998a4789652f85282b3beb4a936e8abb1c5a5e"
+            },
+            "tile": {
+                "path": "contents/previews/preview.png",
+                "sha256": "5f2608f547d0b876e7b60ff26960593a9614bd573214de3055001aa739bd8229"
+            }
+        }
+    }
+}
