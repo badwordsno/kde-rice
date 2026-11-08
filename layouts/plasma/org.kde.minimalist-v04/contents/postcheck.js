@@ -1,5 +1,6 @@
 // Read-only postcheck for the Minimalist v0.4.1 centered task strip.
 
+// BEGIN GENERATED PANEL CONSTANTS
 const spacerType = "org.kde.plasma.panelspacer";
 const taskType = "org.kde.plasma.icontasks";
 const resourceType = "org.kde.minimalist.resources";
@@ -9,42 +10,82 @@ const workspaceType = "org.kde.minimalist.workspaces";
 const expected = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const expectedPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "tasks": 3,
+    "rightSpacer": 4,
+    "resources": 5,
+    "margin": 6,
+    "input": 7,
+    "tray": 8,
+    "clock": 9
+};
 const pagerExpected = [
     "org.kde.plasma.kickoff",
-    pagerType,
+    "org.kde.plasma.pager",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const pagerExpectedPositions = {
+    "launcher": 0,
+    "pager": 1,
+    "title": 2,
+    "leftSpacer": 3,
+    "tasks": 4,
+    "rightSpacer": 5,
+    "resources": 6,
+    "margin": 7,
+    "input": 8,
+    "tray": 9,
+    "clock": 10
+};
 const workspacesExpected = [
     "org.kde.plasma.kickoff",
-    workspaceType,
+    "org.kde.minimalist.workspaces",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const workspacesExpectedPositions = {
+    "launcher": 0,
+    "workspaces": 1,
+    "title": 2,
+    "leftSpacer": 3,
+    "tasks": 4,
+    "rightSpacer": 5,
+    "resources": 6,
+    "margin": 7,
+    "input": 8,
+    "tray": 9,
+    "clock": 10
+};
+// END GENERATED PANEL CONSTANTS
 const missingConfigValue = "__KDE_RICE_MISSING__";
+
 
 function orderedPanelState(panel) {
     const widgets = panel.widgets();
@@ -110,33 +151,40 @@ function sameSequence(left, right) {
 const panel = panelIds.length === 1 ? panelById(panelIds[0]) : null;
 const state = panel ? orderedPanelState(panel) : {types: [], widgets: [], order: ""};
 let topology = "unknown";
-let offset = 0;
+let positions = null;
 if (sameSequence(state.types, expected)) {
     topology = "minimalist-v04";
+    positions = expectedPositions;
 } else if (sameSequence(state.types, pagerExpected)) {
     topology = "minimalist-v04-pager";
-    offset = 1;
+    positions = pagerExpectedPositions;
 } else if (sameSequence(state.types, workspacesExpected)) {
     topology = "minimalist-v04-workspaces";
-    offset = 1;
+    positions = workspacesExpectedPositions;
 }
 const topologyOk = topology !== "unknown";
-const optionalWidget = offset === 1 ? state.widgets[1] : null;
-const leftSpacer = topologyOk ? state.widgets[2 + offset] : null;
-const tasks = topologyOk ? state.widgets[3 + offset] : null;
-const rightSpacer = topologyOk ? state.widgets[4 + offset] : null;
-const resource = topologyOk ? state.widgets[5 + offset] : null;
-const clock = topologyOk && state.widgets[9 + offset].type === clockType
-    ? state.widgets[9 + offset] : null;
-let optionalWidgetOk = true;
-if (topology === "minimalist-v04-pager") {
+// Check the live widget type before inspecting its policy, independently of
+// the mutation code and the generated role-to-position data.
+function widgetForRole(role, type) {
+    const widget = positions ? state.widgets[positions[role]] : null;
+    return widget && widget.type === type ? widget : null;
+}
+const optionalWidget = topology === "minimalist-v04-pager"
+    ? widgetForRole("pager", pagerType) : widgetForRole("workspaces", workspaceType);
+const leftSpacer = widgetForRole("leftSpacer", spacerType);
+const tasks = widgetForRole("tasks", taskType);
+const rightSpacer = widgetForRole("rightSpacer", spacerType);
+const resource = widgetForRole("resources", resourceType);
+const clock = widgetForRole("clock", clockType);
+let optionalWidgetOk = topology === "minimalist-v04" || !!optionalWidget;
+if (topology === "minimalist-v04-pager" && optionalWidget) {
     const displayedText = readGeneralConfig(optionalWidget, "displayedText", missingConfigValue);
     const showWindowOutlines = readGeneralConfig(optionalWidget, "showWindowOutlines", missingConfigValue);
     const showWindowIcons = readGeneralConfig(optionalWidget, "showWindowIcons", missingConfigValue);
     optionalWidgetOk = (String(displayedText) === "0" || String(displayedText) === "Number")
         && configFalse(showWindowOutlines)
         && configFalse(showWindowIcons);
-} else if (topology === "minimalist-v04-workspaces") {
+} else if (topology === "minimalist-v04-workspaces" && optionalWidget) {
     optionalWidgetOk = String(readGeneralConfig(optionalWidget, "packageRevision", 0)) === "2";
 }
 const leftSpacerOk = !!leftSpacer

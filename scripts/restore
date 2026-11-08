@@ -33,6 +33,7 @@ Options:
 
 Restore never deletes an existing managed target. It moves the current target
 to a timestamped restore-displaced directory before copying the snapshot.
+Preview classifies changes without printing file contents or link targets.
 EOF
 }
 
@@ -79,10 +80,17 @@ require_command realpath
 require_command cp
 require_command date
 require_command mv
+require_command tar
+require_command sha256sum
+require_command awk
 refuse_root
 
 [[ -n $BACKUP ]] || die "--backup is required"
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 BACKUP=$(normalize_existing_directory "$BACKUP" "snapshot")
 load_managed_paths "$MANIFEST"
 
@@ -118,10 +126,24 @@ fi
 
 [[ -f $BACKUP/complete ]] || die "snapshot is incomplete: $BACKUP"
 [[ -f $BACKUP/format-version ]] || die "snapshot format marker is missing"
-[[ $(< "$BACKUP/format-version") == "$KDE_RICE_FORMAT_VERSION" ]] || die "unsupported snapshot format"
+snapshot_format=$(< "$BACKUP/format-version")
+case "$snapshot_format" in
+    1 | "$KDE_RICE_FORMAT_VERSION") ;;
+    *) die "unsupported snapshot format" ;;
+esac
 [[ -f $BACKUP/managed-paths.txt ]] || die "snapshot managed-path manifest is missing"
 [[ -f $BACKUP/state.tsv ]] || die "snapshot state manifest is missing"
 [[ -d $BACKUP/payload ]] || die "snapshot payload directory is missing"
+if [[ $snapshot_format == 2 ]]; then
+    [[ -f $BACKUP/content.sha256 && ! -L $BACKUP/content.sha256 ]] \
+        || die "snapshot content checksum is missing or unsafe"
+    expected_digest=$(< "$BACKUP/content.sha256")
+    [[ $expected_digest =~ ^[0-9a-f]{64}$ ]] || die "invalid snapshot content checksum"
+    actual_digest=$(snapshot_content_digest "$BACKUP") || die "cannot verify snapshot content"
+    [[ $actual_digest == "$expected_digest" ]] || die "snapshot content checksum mismatch; nothing restored"
+else
+    warn "legacy format-1 snapshot has no content checksum; only structure can be checked before restore"
+fi
 
 # A snapshot retains the exact scope that existed when it was captured. Older
 # snapshots remain usable after current-scope additions or retirements, but a
@@ -172,18 +194,36 @@ done
 printf 'Restore mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
 printf 'Snapshot: %s\n' "$BACKUP"
 printf 'Target home: %s\n\n' "$TARGET_HOME"
+printf 'Restore replaces complete managed files with the snapshot baseline.\n'
+printf 'Settings changed in those files after the snapshot will also be reverted.\n'
+printf 'Current targets are preserved in restore-displaced state before replacement.\n'
+printf 'Comparison checks contents, modes, directory entries, and link targets; timestamps and ownership are ignored.\n'
+printf 'Unchanged existing targets are also moved aside and restored when applying.\n\n'
 
 for relative in "${MANAGED_PATHS[@]}"; do
     current=$(path_type "$TARGET_HOME/$relative")
     state=${snapshot_state[$relative]}
     if [[ $state == absent ]]; then
         if [[ $current == absent ]]; then
-            printf 'keep absent       %s\n' "$relative"
+            printf '%-19s %s (absent; keep absent)\n' 'unchanged' "$relative"
         else
-            printf 'move aside       %s (%s -> absent)\n' "$relative" "$current"
+            printf '%-19s %s (%s -> absent; move aside)\n' 'new since snapshot' "$relative" "$current"
         fi
+    elif [[ $current == absent ]]; then
+        printf '%-19s %s (absent -> %s; restore)\n' 'missing now' "$relative" "$state"
+    elif [[ $current != "$state" ]]; then
+        printf '%-19s %s (%s -> %s; move aside and restore)\n' 'type changed' "$relative" "$current" "$state"
     else
-        printf 'restore %-9s %s (current: %s)\n' "$state" "$relative" "$current"
+        expected_digest=$(managed_path_digest "$BACKUP/payload" "$relative") \
+            || die "cannot compare snapshot target: $relative; nothing restored"
+        actual_digest=$(managed_path_digest "$TARGET_HOME" "$relative") \
+            || die "cannot compare current target: $relative; nothing restored"
+        if [[ $actual_digest == "$expected_digest" ]]; then
+            difference=unchanged
+        else
+            difference=changed
+        fi
+        printf '%-19s %s (%s; move aside and restore)\n' "$difference" "$relative" "$state"
     fi
 done
 
@@ -210,6 +250,7 @@ displaced="$STATE_ROOT/restore-displaced/$timestamp"
 umask 077
 mkdir -p -- "$displaced"
 : > "$displaced/restore-log.tsv"
+printf 'Recovery state for this restore: %s\n' "$displaced"
 
 for relative in "${MANAGED_PATHS[@]}"; do
     destination="$TARGET_HOME/$relative"
@@ -231,5 +272,19 @@ for relative in "${MANAGED_PATHS[@]}"; do
     fi
 done
 
+for relative in "${MANAGED_PATHS[@]}"; do
+    state=${snapshot_state[$relative]}
+    [[ $(path_type "$TARGET_HOME/$relative") == "$state" ]] \
+        || die "restore verification failed for $relative; displaced files remain in $displaced"
+    if [[ $state != absent ]]; then
+        expected_digest=$(managed_path_digest "$BACKUP/payload" "$relative") \
+            || die "cannot read baseline during restore verification: $relative"
+        actual_digest=$(managed_path_digest "$TARGET_HOME" "$relative") \
+            || die "cannot read restored target: $relative"
+        [[ $actual_digest == "$expected_digest" ]] \
+            || die "restore content verification failed for $relative; displaced files remain in $displaced"
+    fi
+done
+printf 'verified\n' > "$displaced/complete"
 printf '\nRestore complete. Previous live targets are recoverable from:\n%s\n' "$displaced"
 printf 'Plasma and KWin were not restarted automatically.\n'

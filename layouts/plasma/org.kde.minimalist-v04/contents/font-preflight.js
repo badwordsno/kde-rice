@@ -89,6 +89,9 @@ const resourceRevision = resources ? String(readGeneral(resources, "packageRevis
 const activeFontRevision = activeTitle ? String(readGeneral(activeTitle, "fontPolicyRevision", 0)) : "none";
 const workspaceFontRevision = workspace ? String(readGeneral(workspace, "fontPolicyRevision", 0)) : "none";
 const resourceFontRevision = resources ? String(readGeneral(resources, "fontPolicyRevision", 0)) : "none";
+const activeUiRevision = activeTitle ? String(readGeneral(activeTitle, "chimeraUiRevision", 0)) : "none";
+const workspaceUiRevision = workspace ? String(readGeneral(workspace, "chimeraUiRevision", 0)) : "none";
+const resourceUiRevision = resources ? String(readGeneral(resources, "chimeraUiRevision", 0)) : "none";
 const clockFontFamily = clock ? String(readAppearance(clock, "fontFamily", "missing")) : "none";
 const clockAuto = clock ? String(readAppearance(clock, "autoFontAndSize", "missing")) : "none";
 const clockSize = clock ? String(readAppearance(clock, "fontSize", "missing")) : "none";
@@ -109,6 +112,19 @@ if (packageRevisionsOk && clockShapeOk
         && resourceFontRevision === "2" && clockFontFamily === "Noto Sans") {
     fontState = "target";
 }
+let uiState = "unknown";
+let uiRevision = "unknown";
+if (packageRevisionsOk
+        && activeUiRevision === workspaceUiRevision
+        && activeUiRevision === resourceUiRevision
+        && (activeUiRevision === "0" || activeUiRevision === "1")) {
+    uiState = "source";
+    uiRevision = activeUiRevision;
+} else if (packageRevisionsOk && activeUiRevision === "2"
+        && workspaceUiRevision === "2" && resourceUiRevision === "2") {
+    uiState = "target";
+    uiRevision = "2";
+}
 let anchorsReady = topologyOk;
 for (const widget of [workspace, activeTitle, resources]) {
     anchorsReady = anchorsReady && !!widget.geometry
@@ -117,6 +133,11 @@ for (const widget of [workspace, activeTitle, resources]) {
         && typeof widget.geometry.height === "number"
         && widget.geometry.height > 0;
 }
+const projectGeometryOk = anchorsReady
+    && workspace.geometry.y === 4 && workspace.geometry.height === 24
+    && resources.geometry.y === 4 && resources.geometry.height === 24
+    && ((activeTitle.geometry.y === 0 && activeTitle.geometry.height === 32)
+        || (activeTitle.geometry.y === 4 && activeTitle.geometry.height === 24));
 const customTypesKnown = knownWidgetTypes.indexOf(activeTitleType) !== -1
     && knownWidgetTypes.indexOf(workspaceType) !== -1
     && knownWidgetTypes.indexOf(resourceType) !== -1;
@@ -127,18 +148,24 @@ print(
     + " topologyOk=" + topologyOk
     + " geometryOk=" + geometryOk
     + " anchorsReady=" + anchorsReady
+    + " projectGeometryOk=" + projectGeometryOk
     + " customTypesKnown=" + customTypesKnown
     + " fontState=" + fontState
+    + " uiState=" + uiState
+    + " uiRevision=" + uiRevision
     + " activeRevision=" + activeRevision
     + " workspaceRevision=" + workspaceRevision
     + " resourceRevision=" + resourceRevision
     + " activeFontRevision=" + activeFontRevision
     + " workspaceFontRevision=" + workspaceFontRevision
     + " resourceFontRevision=" + resourceFontRevision
+    + " activeUiRevision=" + activeUiRevision
+    + " workspaceUiRevision=" + workspaceUiRevision
+    + " resourceUiRevision=" + resourceUiRevision
     + " clockFontFamily=" + clockFontFamily.split(" ").join("_")
     + " widgets=" + (state.types.length ? state.types.join(";") : "none")
 );
-if (topologyOk && geometryOk && anchorsReady && customTypesKnown
-        && fontState !== "unknown") {
+if (topologyOk && geometryOk && anchorsReady && projectGeometryOk && customTypesKnown
+        && fontState !== "unknown" && uiState !== "unknown") {
     print(" MINIMALIST_FONT_PREFLIGHT_OK");
 }

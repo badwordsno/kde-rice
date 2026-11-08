@@ -3,6 +3,12 @@
 // only the exact Workspaces instance so Plasma reloads that restored package.
 
 const workspaceType = "org.kde.minimalist.workspaces";
+const workspaceUserConfigKeys = [
+    ["labelMode", 0], ["hideWhenSingle", false], ["wrapWheel", false],
+    ["invertWheel", false], ["density", 0], ["surfaceStyle", 0],
+    ["bevelDepth", 2],
+    ["motionEnabled", true]
+];
 const baseWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
@@ -40,9 +46,28 @@ function sameCounts(left, right) {
     return true;
 }
 
-function configureRevisionOne(widget) {
+function captureWorkspaceUserConfig(widget) {
+    if (!widget) return null;
+    const result = {};
     const previousGroup = widget.currentConfigGroup;
     widget.currentConfigGroup = ["General"];
+    for (let index = 0; index < workspaceUserConfigKeys.length; ++index) {
+        const entry = workspaceUserConfigKeys[index];
+        result[entry[0]] = widget.readConfig(entry[0], entry[1]);
+    }
+    widget.currentConfigGroup = previousGroup;
+    return result;
+}
+
+function configureRevisionOne(widget, userConfig) {
+    const previousGroup = widget.currentConfigGroup;
+    widget.currentConfigGroup = ["General"];
+    if (userConfig) {
+        const keys = Object.keys(userConfig);
+        for (let index = 0; index < keys.length; ++index) {
+            widget.writeConfig(keys[index], userConfig[keys[index]]);
+        }
+    }
     widget.writeConfig("packageRevision", 1);
     widget.reloadConfig();
     widget.currentConfigGroup = previousGroup;
@@ -74,6 +99,8 @@ if (!sameCounts(preservedTypes, baseWidgets)
 }
 
 let removedId = "none";
+const workspaceUserConfig = workspaceWidgets.length === 1
+    ? captureWorkspaceUserConfig(workspaceWidgets[0]) : null;
 if (workspaceWidgets.length === 1) {
     removedId = workspaceWidgets[0].id;
     workspaceWidgets[0].remove();
@@ -89,7 +116,7 @@ const workspace = panel.addWidget(
 if (!workspace || workspace.type !== workspaceType) {
     throw new Error("refresh restore could not recreate Minimalist Workspaces");
 }
-configureRevisionOne(workspace);
+configureRevisionOne(workspace, workspaceUserConfig);
 print(
     "MINIMALIST_WORKSPACES_REFRESH_RESTORE_OK"
     + " removedWorkspaceId=" + removedId

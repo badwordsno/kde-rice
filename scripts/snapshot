@@ -59,9 +59,16 @@ done
 require_command realpath
 require_command cp
 require_command date
+require_command tar
+require_command sha256sum
+require_command awk
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if ! $DRY_RUN; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 load_managed_paths "$MANIFEST"
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -102,5 +109,6 @@ for relative in "${MANAGED_PATHS[@]}"; do
     fi
 done
 
+snapshot_content_digest "$OUTPUT" > "$OUTPUT/content.sha256"
 printf 'complete\n' > "$OUTPUT/complete"
 printf '\nSnapshot complete: %s\n' "$OUTPUT"

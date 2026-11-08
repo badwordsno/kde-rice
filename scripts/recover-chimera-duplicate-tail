@@ -1,0 +1,660 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MANIFEST="$REPO_ROOT/config/managed-paths.txt"
+TARGET_HOME=${HOME:-}
+SOURCE_RECEIPT=
+APPLY=false
+ALLOW_DEGRADED=false
+DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
+VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
+LAYOUT_SOURCE="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v04"
+LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-v04"
+PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+PREFLIGHT_NAME=duplicate-tail-preflight.js
+CLEANUP_NAME=duplicate-tail-cleanup.js
+POSTCHECK_NAME=duplicate-tail-postcheck.js
+
+STABLE_IDS=(30 80 81 32 56 55 82 33 34 35 61)
+STABLE_TYPES=(
+    org.kde.plasma.kickoff
+    org.kde.minimalist.workspaces
+    org.kde.minimalist.activewindowtitle
+    org.kde.plasma.panelspacer
+    org.kde.plasma.icontasks
+    org.kde.plasma.panelspacer
+    org.kde.minimalist.resources
+    org.kde.plasma.marginsseparator
+    org.kde.plasma.kimpanel
+    org.kde.plasma.systemtray
+    org.kde.plasma.digitalclock
+)
+STALE_ACTIVE_ID=75
+STALE_RESOURCE_ID=76
+STALE_ACTIVE_TYPE=org.kde.minimalist.activewindowtitle
+STALE_RESOURCE_TYPE=org.kde.minimalist.resources
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/recover-chimera-duplicate-tail --receipt ABSOLUTE_PATH [OPTIONS]
+
+Preview or recover the one receipt-bound post-reboot Chimera duplicate tail.
+The guarded apply removes only stale resource applet 76 and stale active-title
+applet 75. It never adds, recreates, reorders, moves, or configures a keeper.
+
+Options:
+  --receipt PATH        Trusted chimera-refresh-capture.json (required)
+  --home ABSOLUTE_PATH  Target home (default: $HOME)
+  --apply               Snapshot and perform the exact live recovery
+  --dry-run             Print the complete plan without writing (default)
+  --allow-degraded      Explicitly accept doctor's reviewed recovery state
+  -h, --help            Show this help
+
+Plasma and KWin are never restarted. Unknown and near-match topologies are
+refused. A snapshot captured from source13 or partial12 contains stale applet
+groups and may be restored only while Plasma is logged out.
+EOF
+}
+
+usage_error() {
+    printf 'error: %s\n' "$*" >&2
+    exit 64
+}
+
+while (($#)); do
+    case "$1" in
+        --receipt)
+            (($# >= 2)) || usage_error "--receipt requires a path"
+            SOURCE_RECEIPT=$2
+            shift 2
+            ;;
+        --home)
+            (($# >= 2)) || usage_error "--home requires a path"
+            TARGET_HOME=$2
+            shift 2
+            ;;
+        --apply) APPLY=true; shift ;;
+        --dry-run) APPLY=false; shift ;;
+        --allow-degraded) ALLOW_DEGRADED=true; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) usage_error "unknown argument: $1" ;;
+    esac
+done
+[[ -n $SOURCE_RECEIPT ]] || usage_error "--receipt is required"
+
+for command_name in realpath jq sha256sum awk sed sort cmp kreadconfig6 \
+    date sleep sync mkdir cp mv diff grep; do
+    require_command "$command_name"
+done
+refuse_root
+TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
+if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
+    || -v KDE_RICE_DBUS_TOOL ]]; then
+    [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
+        || die "internal duplicate-tail overrides are available only in isolated test mode"
+fi
+require_current_desktop_home "$TARGET_HOME" dbus-mock
+[[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
+[[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
+for source_name in "$PREFLIGHT_NAME" "$CLEANUP_NAME" "$POSTCHECK_NAME"; do
+    [[ -f $LAYOUT_SOURCE/contents/$source_name \
+        && ! -L $LAYOUT_SOURCE/contents/$source_name ]] \
+        || die "duplicate-tail recovery source is incomplete: $source_name"
+done
+
+printf '1. Host diagnosis (read-only)\n'
+set +e
+doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 --json 2>&1)
+doctor_status=$?
+set -e
+printf '%s\n' "$doctor_output"
+case "$doctor_status" in
+    0) ;;
+    1)
+        printf '%s\n' "$doctor_output" | jq -e '
+            .status == "degraded"
+            and .summary.unsupported == 0
+            and .checks.panels.status == "degraded"
+            and (.checks.panels.detail
+                | contains("recover-v04-workspaces-duplicate-tail"))
+            and ([.checks | to_entries[]
+                | select(.value.status == "degraded" and .key != "panels")]
+                | length == 0)
+        ' >/dev/null \
+            || die "doctor degradation is not the one exact duplicate-tail recovery condition"
+        if $APPLY && ! $ALLOW_DEGRADED; then
+            die "doctor reported the reviewed duplicate-tail degradation; rerun with --allow-degraded only after accepting the printed plan"
+        fi
+        ;;
+    2) die "doctor reported unsupported; duplicate-tail recovery is refused" ;;
+    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
+esac
+
+DBUS_TOOL=$(resolve_dbus_tool) \
+    || die "required Plasma 6 D-Bus client not found"
+load_managed_paths "$MANIFEST"
+declare -A managed=()
+for relative in "${MANAGED_PATHS[@]}"; do managed[$relative]=1; done
+for relative in "$LAYOUT_TARGET_RELATIVE" "$PANEL_CONFIG_RELATIVE"; do
+    validate_relative_path "$relative" || die "unsafe recovery target: $relative"
+    [[ -n ${managed[$relative]+x} ]] \
+        || die "recovery target is outside config/managed-paths.txt: $relative"
+    assert_parent_within_home "$TARGET_HOME" "$relative"
+done
+
+[[ $SOURCE_RECEIPT == /* ]] || die "source receipt path must be absolute"
+[[ -f $SOURCE_RECEIPT && ! -L $SOURCE_RECEIPT ]] \
+    || die "source receipt must be a regular non-symlink file"
+source_receipt_canonical=$(realpath -e -- "$SOURCE_RECEIPT") \
+    || die "source receipt could not be resolved"
+[[ $source_receipt_canonical == "$SOURCE_RECEIPT" ]] \
+    || die "source receipt path must already be canonical"
+source_receipt_root=$(realpath -m -- \
+    "$TARGET_HOME/.local/state/kde-rice/apply-displaced")
+case "$source_receipt_canonical" in
+    "$source_receipt_root"/*/chimera-refresh-capture.json) ;;
+    *) die "source receipt is outside the canonical panel-font receipt root" ;;
+esac
+
+jq -e '
+    .schemaVersion == 1
+    and (.snapshotPath | type == "string" and startswith("/"))
+    and (.captureSha256 | type == "string"
+        and test("^[0-9a-f]{64}$"))
+    and .capture.schemaVersion == 1
+    and (.capture.panelId | type == "number" and . > 0 and floor == .)
+    and .capture.orderedIds == [30,80,81,32,56,55,82,33,34,35,61]
+    and .capture.orderedTypes == [
+        "org.kde.plasma.kickoff",
+        "org.kde.minimalist.workspaces",
+        "org.kde.minimalist.activewindowtitle",
+        "org.kde.plasma.panelspacer",
+        "org.kde.plasma.icontasks",
+        "org.kde.plasma.panelspacer",
+        "org.kde.minimalist.resources",
+        "org.kde.plasma.marginsseparator",
+        "org.kde.plasma.kimpanel",
+        "org.kde.plasma.systemtray",
+        "org.kde.plasma.digitalclock"
+    ]
+    and .capture.workspace.id == 80
+    and .capture.workspace.type == "org.kde.minimalist.workspaces"
+    and .capture.activeTitle.id == 81
+    and .capture.activeTitle.type == "org.kde.minimalist.activewindowtitle"
+    and .capture.resources.id == 82
+    and .capture.resources.type == "org.kde.minimalist.resources"
+    and ([.capture.workspace, .capture.activeTitle, .capture.resources]
+        | all(.userConfig | type == "object")
+        and all(.presentUserConfigKeys | type == "array"))
+' "$source_receipt_canonical" >/dev/null \
+    || die "source receipt schema or stable applet identity is invalid"
+
+source_capture=$(jq -c '.capture' "$source_receipt_canonical")
+source_capture_sha=$(printf '%s' "$source_capture" | sha256sum)
+source_capture_sha=${source_capture_sha%% *}
+recorded_capture_sha=$(jq -r '.captureSha256' "$source_receipt_canonical")
+[[ $source_capture_sha == "$recorded_capture_sha" ]] \
+    || die "source receipt capture SHA-256 does not match"
+source_receipt_sha=$(sha256sum -- "$source_receipt_canonical")
+source_receipt_sha=${source_receipt_sha%% *}
+
+source_snapshot=$(jq -r '.snapshotPath' "$source_receipt_canonical")
+[[ $source_snapshot == /* && -d $source_snapshot && ! -L $source_snapshot ]] \
+    || die "source receipt snapshot is missing or unsafe"
+source_snapshot_canonical=$(realpath -e -- "$source_snapshot") \
+    || die "source receipt snapshot could not be resolved"
+[[ $source_snapshot_canonical == "$source_snapshot" ]] \
+    || die "source snapshot path must already be canonical"
+snapshot_root=$(realpath -m -- "$TARGET_HOME/.local/state/kde-rice/snapshots")
+case "$source_snapshot_canonical" in
+    "$snapshot_root"/*) ;;
+    *) die "source snapshot is outside the canonical snapshot root" ;;
+esac
+[[ -f $source_snapshot_canonical/complete \
+    && ! -L $source_snapshot_canonical/complete ]] \
+    || die "source snapshot is incomplete"
+[[ -f $source_snapshot_canonical/managed-paths.txt \
+    && ! -L $source_snapshot_canonical/managed-paths.txt ]] \
+    || die "source snapshot has no safe managed-path manifest"
+cmp -s -- "$MANIFEST" "$source_snapshot_canonical/managed-paths.txt" \
+    || die "source snapshot does not cover the current complete managed scope"
+snapshot_panel_config="$source_snapshot_canonical/payload/$PANEL_CONFIG_RELATIVE"
+[[ -f $snapshot_panel_config && ! -L $snapshot_panel_config ]] \
+    || die "source snapshot has no safe panel configuration payload"
+
+panel_id=$(jq -r '.capture.panelId' "$source_receipt_canonical")
+[[ $panel_id =~ ^[1-9][0-9]*$ ]] || die "source receipt panel ID is invalid"
+stable_order=$(IFS=';'; printf '%s' "${STABLE_IDS[*]}")
+
+read_panel_order() {
+    local file=$1
+    kreadconfig6 --file "$file" --group Containments --group "$panel_id" \
+        --group General --key AppletOrder --default __KDE_RICE_MISSING__
+}
+
+expected_plugin_map() {
+    local state=$1 index
+    {
+        for index in "${!STABLE_IDS[@]}"; do
+            printf '%s:%s\n' "${STABLE_IDS[$index]}" "${STABLE_TYPES[$index]}"
+        done
+        case "$state" in
+            source13)
+                printf '%s:%s\n' "$STALE_ACTIVE_ID" "$STALE_ACTIVE_TYPE"
+                printf '%s:%s\n' "$STALE_RESOURCE_ID" "$STALE_RESOURCE_TYPE"
+                ;;
+            partial12) printf '%s:%s\n' "$STALE_ACTIVE_ID" "$STALE_ACTIVE_TYPE" ;;
+            target11) ;;
+            *) return 1 ;;
+        esac
+    } | sort -t: -k1,1n
+}
+
+actual_plugin_map() {
+    local file=$1 id plugin
+    while IFS= read -r id; do
+        [[ $id =~ ^[0-9]+$ ]] || return 1
+        plugin=$(kreadconfig6 --file "$file" --group Containments \
+            --group "$panel_id" --group Applets --group "$id" \
+            --key plugin --default __KDE_RICE_MISSING__) || return 1
+        [[ $plugin == __KDE_RICE_MISSING__ || -z $plugin ]] \
+            || printf '%s:%s\n' "$id" "$plugin"
+    done < <(sed -nE \
+        "s/^\\[Containments\\]\\[$panel_id\\]\\[Applets\\]\\[([0-9]+)\\]$/\\1/p" \
+        "$file" | sort -n)
+}
+
+stale_subtree_present() {
+    local file=$1 id=$2
+    grep -Fq "[Containments][$panel_id][Applets][$id]" "$file"
+}
+
+direct_plugins_match() {
+    local file=$1 state=$2 expected actual
+    expected=$(expected_plugin_map "$state") || return 1
+    actual=$(actual_plugin_map "$file") || return 1
+    [[ $actual == "$expected" ]]
+}
+
+stale_subtrees_match() {
+    local file=$1 state=$2 active=false resources=false
+    stale_subtree_present "$file" "$STALE_ACTIVE_ID" && active=true
+    stale_subtree_present "$file" "$STALE_RESOURCE_ID" && resources=true
+    case "$state" in
+        source13) [[ $active == true && $resources == true ]] ;;
+        partial12) [[ $active == true && $resources == false ]] ;;
+        target11) [[ $active == false && $resources == false ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+expected_order_for_state() {
+    case "$1" in
+        source13) printf '%s;%s;%s\n' "$stable_order" "$STALE_ACTIVE_ID" "$STALE_RESOURCE_ID" ;;
+        partial12) printf '%s;%s\n' "$stable_order" "$STALE_ACTIVE_ID" ;;
+        target11) printf '%s\n' "$stable_order" ;;
+        *) return 1 ;;
+    esac
+}
+
+normalized_panel_hash() {
+    local file=$1
+    awk -v panel="$panel_id" -v stable="$stable_order" '
+        function stale_group(line) {
+            return line ~ ("^\\[Containments\\]\\[" panel "\\]\\[Applets\\]\\[(75|76)\\](\\[.*\\])?$")
+        }
+        /^\[/ {
+            group = $0
+            skip = stale_group($0)
+        }
+        skip { next }
+        group == "[Containments][" panel "][General]" && /^AppletOrder=/ {
+            print "AppletOrder=" stable
+            next
+        }
+        /[^[:space:]]/ { print }
+    ' "$file" | sha256sum | awk '{print $1}'
+}
+
+persistent_state_matches() {
+    local file=$1 state=$2 expected_order actual_order semantic_hash
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    expected_order=$(expected_order_for_state "$state") || return 1
+    actual_order=$(read_panel_order "$file") || return 1
+    [[ $actual_order == "$expected_order" ]] || return 1
+    direct_plugins_match "$file" "$state" || return 1
+    stale_subtrees_match "$file" "$state" || return 1
+    semantic_hash=$(normalized_panel_hash "$file") || return 1
+    [[ $semantic_hash == "$baseline_semantic_sha" ]]
+}
+
+snapshot_order=$(read_panel_order "$snapshot_panel_config") \
+    || die "source snapshot AppletOrder could not be read"
+[[ $snapshot_order == "$stable_order" ]] \
+    || die "source snapshot AppletOrder is not the exact receipt target"
+direct_plugins_match "$snapshot_panel_config" source13 \
+    || die "source snapshot direct applet map does not contain only the target and stale 75/76"
+stale_subtrees_match "$snapshot_panel_config" source13 \
+    || die "source snapshot does not prove both stale applet subtrees"
+baseline_semantic_sha=$(normalized_panel_hash "$snapshot_panel_config") \
+    || die "source snapshot semantic baseline could not be hashed"
+
+panel_config="$TARGET_HOME/$PANEL_CONFIG_RELATIVE"
+[[ -f $panel_config && ! -L $panel_config && -r $panel_config ]] \
+    || die "live panel configuration is missing or unsafe"
+
+evaluate_plasma_script() {
+    "$DBUS_TOOL" org.kde.plasmashell /PlasmaShell \
+        org.kde.PlasmaShell.evaluateScript "$1"
+}
+
+capture_preflight() {
+    local script_file=$1 output capture
+    local stable_literal
+    stable_literal=$(printf '%s' "$source_capture" | jq -Rs .)
+    output=$(evaluate_plasma_script \
+        "var expectedStablePanelState = JSON.parse($stable_literal);$(< "$script_file")") \
+        || return 1
+    printf '%s\n' "$output" >&2
+    [[ $output == *MINIMALIST_V04_DUPLICATE_TAIL_PREFLIGHT_OK* \
+        && $output == *MINIMALIST_V04_DUPLICATE_TAIL_CAPTURE=* ]] || return 1
+    capture=${output#*MINIMALIST_V04_DUPLICATE_TAIL_CAPTURE=}
+    capture=${capture%%MINIMALIST_V04_DUPLICATE_TAIL_PREFLIGHT*}
+    printf '%s\n' "$capture" | jq -e '
+        .schemaVersion == 1
+        and (.topologyState == "source13"
+            or .topologyState == "partial12"
+            or .topologyState == "target11")
+        and .panel.id == 29
+        and .panel.screen == 0
+        and .panel.location == "top"
+        and .panel.formFactor == "horizontal"
+        and .panel.height == 32
+        and .panel.lengthMode == "fill"
+        and .panel.hiding == "none"
+        and .panel.floating == false
+        and .panel.opacity == "opaque"
+        and (.stableWidgets | type == "array" and length == 11)
+        and ([.stableWidgets[].id] == [30,80,81,32,56,55,82,33,34,35,61])
+    ' >/dev/null || return 1
+    printf '%s' "$capture" | jq -c .
+}
+
+printf '\n2. Receipt-bound topology and persistence proof (read-only)\n'
+preflight_capture=$(capture_preflight "$LAYOUT_SOURCE/contents/$PREFLIGHT_NAME") \
+    || die "live duplicate-tail preflight did not prove an exact recovery state"
+topology_state=$(printf '%s' "$preflight_capture" | jq -r '.topologyState')
+persistent_state_matches "$panel_config" "$topology_state" \
+    || die "live and persistent panel state do not match the receipt-bound $topology_state state"
+before_panel_sha=$(sha256sum -- "$panel_config")
+before_panel_sha=${before_panel_sha%% *}
+preflight_capture_sha=$(printf '%s' "$preflight_capture" | sha256sum)
+preflight_capture_sha=${preflight_capture_sha%% *}
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+recovery_id="$timestamp-chimera-duplicate-tail-$$"
+snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$recovery_id"
+recovery_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$recovery_id"
+recovery_receipt="$recovery_path/duplicate-tail-recovery.json"
+layout_destination="$TARGET_HOME/$LAYOUT_TARGET_RELATIVE"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$recovery_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$recovery_id"
+printf -v restore_preview '%q --backup %q --home %q' \
+    "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
+printf -v restore_apply '%s --apply' "$restore_preview"
+
+printf '\n3. Complete ordered change plan\n'
+printf '  compatibility: %s\n' "$([[ $doctor_status == 1 ]] && printf degraded || printf supported)"
+printf '  current topology: one screen-0 top horizontal 32px fill/opaque panel, id=%s\n' "$panel_id"
+printf '  current convergence state: %s\n' "$topology_state"
+printf '  current persistent AppletOrder: %s\n' "$(read_panel_order "$panel_config")"
+printf '  keeper IDs: %s\n' "$stable_order"
+printf '  panel removals/additions: none\n'
+case "$topology_state" in
+    source13)
+        printf '  applet removals, in order: %s:%s, then %s:%s\n' \
+            "$STALE_RESOURCE_ID" "$STALE_RESOURCE_TYPE" \
+            "$STALE_ACTIVE_ID" "$STALE_ACTIVE_TYPE"
+        ;;
+    partial12)
+        printf '  applet removals: %s:%s only (resume after resource removal)\n' \
+            "$STALE_ACTIVE_ID" "$STALE_ACTIVE_TYPE"
+        ;;
+    target11) printf '  applet removals: none (already converged)\n' ;;
+esac
+printf '  applet additions/recreation/manual ordering: none\n'
+printf '  keeper policy: preserve exact IDs/types/order, user settings, revisions, and vertical geometry; allow Plasma flex-spacer x/width reflow\n'
+printf '  managed asset write: %s -> %s\n' \
+    "layouts/plasma/org.kde.minimalist-v04" "$LAYOUT_TARGET_RELATIVE"
+printf '  managed config that Plasma may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+printf '  snapshot all exact paths in config/managed-paths.txt -> %s\n' "$snapshot_path"
+printf '  exact snapshot/restore scope:\n'
+for relative in "${MANAGED_PATHS[@]}"; do printf '    %s\n' "$relative"; done
+printf '  postcheck: live target11 plus stable persistent AppletOrder/direct plugin map, no 75/76 subtree, and unchanged non-stale KConfig semantics\n'
+printf '  excluded and untouched: display modes, wallpaper, task launchers, KWin, Plasma/KWin processes, packages, and system files\n'
+printf '  rollback preview: %s\n' "$restore_preview"
+if [[ $topology_state == target11 ]]; then
+    printf '  rollback apply: %s\n' "$restore_apply"
+    printf '  rollback caveat: this new snapshot is clean target11; the older source-receipt snapshot remains offline-only\n'
+else
+    printf '  rollback apply (only while logged out of Plasma): %s\n' "$restore_apply"
+    printf '  rollback caveat: this pre-recovery snapshot contains stale groups 75/76; never restore it into a running Plasma session\n'
+fi
+
+if ! $APPLY; then
+    printf '\nDry run only; no snapshot, receipt, asset, panel, applet, or KDE setting was written.\n'
+    exit 0
+fi
+
+printf '\n4. Capturing the complete managed scope before the first write\n'
+capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" \
+    "$SCRIPT_DIR/snapshot" snapshot_path
+
+live_write_attempted=false
+layout_write_attempted=false
+preflight_literal=
+recovery_error() {
+    local status=$? retry_result= retry_post= marker_path= attempt
+    trap - EXIT
+    set +e
+    warn "duplicate-tail recovery stopped after an error; Plasma and KWin were not restarted"
+    if $live_write_attempted && [[ -n $preflight_literal ]]; then
+        retry_result=$(evaluate_plasma_script \
+            "var expectedStablePanelState = JSON.parse($(printf '%s' "$source_capture" | jq -Rs .)); var capturedDuplicateTailState = JSON.parse($preflight_literal);$(< "$layout_destination/contents/$CLEANUP_NAME")" 2>&1)
+        if wait_for_persistent_target; then
+            for attempt in {1..30}; do
+                retry_post=$(evaluate_plasma_script \
+                    "var expectedStablePanelState = JSON.parse($(printf '%s' "$source_capture" | jq -Rs .)); var capturedDuplicateTailState = JSON.parse($preflight_literal);$(< "$layout_destination/contents/$POSTCHECK_NAME")" 2>&1)
+                [[ $retry_post == *MINIMALIST_V04_DUPLICATE_TAIL_POSTCHECK_OK* ]] \
+                    && break
+                ((attempt == 30)) || sleep 0.1
+            done
+        fi
+        if [[ $retry_post == *MINIMALIST_V04_DUPLICATE_TAIL_POSTCHECK_OK* ]]; then
+            warn "the idempotent forward recovery converged to the exact target after the error"
+            marker_path="$recovery_path/recovered-after-error"
+        else
+            warn "forward recovery could not prove an exact target; do not restore the snapshot while Plasma is running"
+            marker_path="$recovery_path/failed"
+        fi
+    else
+        if $layout_write_attempted; then
+            "$SCRIPT_DIR/restore" --backup "$snapshot_path" \
+                --home "$TARGET_HOME" --apply >&2
+            warn "the pre-mutation complete snapshot was restored"
+        fi
+        marker_path="$recovery_path/failed"
+    fi
+    if [[ -n $marker_path && -d $recovery_path ]]; then
+        printf '%s\n' "$status" > "$marker_path"
+        sync -f "$marker_path" 2>/dev/null || true
+    fi
+    warn "retained snapshot: $snapshot_path"
+    warn "offline-only restore command: $restore_apply"
+    exit "$status"
+}
+
+wait_for_persistent_target() {
+    local attempt current_sha previous_sha= stable_reads=0
+    for attempt in {1..50}; do
+        if persistent_state_matches "$panel_config" target11; then
+            current_sha=$(sha256sum -- "$panel_config")
+            current_sha=${current_sha%% *}
+            if [[ $current_sha == "$previous_sha" ]]; then
+                ((stable_reads += 1))
+            else
+                stable_reads=1
+                previous_sha=$current_sha
+            fi
+            ((stable_reads >= 2)) && return 0
+        else
+            stable_reads=0
+            previous_sha=
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+trap recovery_error EXIT
+umask 077
+mkdir -p -- "$recovery_path"
+receipt_temporary="$recovery_receipt.kde-rice-new-$$"
+[[ ! -e $receipt_temporary && ! -L $receipt_temporary ]] \
+    || die "temporary recovery receipt path already exists"
+jq -cn \
+    --arg sourceReceipt "$source_receipt_canonical" \
+    --arg sourceReceiptSha256 "$source_receipt_sha" \
+    --arg sourceCaptureSha256 "$source_capture_sha" \
+    --arg snapshotPath "$snapshot_path" \
+    --arg beforeAppletsrcSha256 "$before_panel_sha" \
+    --arg baselineSemanticSha256 "$baseline_semantic_sha" \
+    --arg preflightCaptureSha256 "$preflight_capture_sha" \
+    --argjson preflightCapture "$preflight_capture" \
+    '{schemaVersion: 1, sourceReceipt: $sourceReceipt,
+      sourceReceiptSha256: $sourceReceiptSha256,
+      sourceCaptureSha256: $sourceCaptureSha256,
+      snapshotPath: $snapshotPath,
+      beforeAppletsrcSha256: $beforeAppletsrcSha256,
+      baselineSemanticSha256: $baselineSemanticSha256,
+      preflightCaptureSha256: $preflightCaptureSha256,
+      preflightCapture: $preflightCapture}' > "$receipt_temporary"
+sync -f "$receipt_temporary"
+mv -- "$receipt_temporary" "$recovery_receipt"
+sync -f "$recovery_receipt"
+
+install_layout_directory() {
+    local destination=$layout_destination
+    local temporary="$destination.kde-rice-new-$$"
+    local displaced="$recovery_path/replaced/$LAYOUT_TARGET_RELATIVE"
+    local current
+    current=$(path_type "$destination")
+    [[ $current != unsupported && $current != symlink ]] \
+        || die "managed layout target has an unsafe type"
+    [[ ! -e $temporary && ! -L $temporary ]] \
+        || die "temporary layout path already exists"
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -a -- "$LAYOUT_SOURCE" "$temporary"
+    layout_write_attempted=true
+    if [[ $current != absent ]]; then
+        mkdir -p -- "$(dirname -- "$displaced")"
+        mv -- "$destination" "$displaced"
+    fi
+    mv -- "$temporary" "$destination"
+    diff -qr -- "$LAYOUT_SOURCE" "$destination" >/dev/null \
+        || die "installed recovery layout differs from source"
+}
+
+printf '\n5. Installing the exact guarded recovery layout asset\n'
+install_layout_directory
+
+printf '\n6. Final topology and file TOCTOU gate before live mutation\n'
+write_capture=$(capture_preflight "$layout_destination/contents/$PREFLIGHT_NAME") \
+    || die "installed preflight no longer proves the exact recovery state"
+write_capture_canonical=$(printf '%s' "$write_capture" | jq -Sc .)
+initial_capture_canonical=$(printf '%s' "$preflight_capture" | jq -Sc .)
+[[ $write_capture_canonical == "$initial_capture_canonical" ]] \
+    || die "live keeper or duplicate state changed before mutation"
+current_panel_sha=$(sha256sum -- "$panel_config")
+current_panel_sha=${current_panel_sha%% *}
+[[ $current_panel_sha == "$before_panel_sha" ]] \
+    || die "persistent panel file changed before mutation"
+persistent_state_matches "$panel_config" "$topology_state" \
+    || die "persistent panel state changed before mutation"
+
+preflight_literal=$(printf '%s' "$preflight_capture" | jq -Rs .)
+stable_literal=$(printf '%s' "$source_capture" | jq -Rs .)
+printf '\n7. Removing only the receipt-bound stale tail\n'
+live_write_attempted=true
+cleanup_result=$(evaluate_plasma_script \
+    "var expectedStablePanelState = JSON.parse($stable_literal); var capturedDuplicateTailState = JSON.parse($preflight_literal);$(< "$layout_destination/contents/$CLEANUP_NAME")")
+printf '%s\n' "$cleanup_result"
+[[ $cleanup_result == *MINIMALIST_V04_DUPLICATE_TAIL_CLEANUP_OK* ]] \
+    || die "Plasma did not confirm the exact duplicate-tail cleanup"
+
+printf '\n8. Live and persistent postcheck\n'
+post_result=
+for attempt in {1..30}; do
+    post_result=$(evaluate_plasma_script \
+        "var expectedStablePanelState = JSON.parse($stable_literal); var capturedDuplicateTailState = JSON.parse($preflight_literal);$(< "$layout_destination/contents/$POSTCHECK_NAME")")
+    [[ $post_result == *MINIMALIST_V04_DUPLICATE_TAIL_POSTCHECK_OK* ]] && break
+    ((attempt == 30)) || sleep 0.1
+done
+printf '%s\n' "$post_result"
+[[ $post_result == *MINIMALIST_V04_DUPLICATE_TAIL_POSTCHECK_OK* ]] \
+    || die "live keeper state did not settle to the exact target"
+wait_for_persistent_target \
+    || die "persistent AppletOrder or stale applet groups did not converge"
+second_post=$(evaluate_plasma_script \
+    "var expectedStablePanelState = JSON.parse($stable_literal); var capturedDuplicateTailState = JSON.parse($preflight_literal);$(< "$layout_destination/contents/$POSTCHECK_NAME")")
+printf '%s\n' "$second_post"
+[[ $second_post == *MINIMALIST_V04_DUPLICATE_TAIL_POSTCHECK_OK* ]] \
+    || die "live target changed while persistent state was settling"
+after_panel_sha=$(sha256sum -- "$panel_config")
+after_panel_sha=${after_panel_sha%% *}
+
+printf '\n9. Repository read-only verification\n'
+set +e
+verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
+    --panel-target minimalist-v04-workspaces --json 2>&1)
+verify_status=$?
+set -e
+printf '%s\n' "$verify_output"
+verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
+    '[.checks[] | select(.name != "display_configuration_unchanged"
+        and .ok != true)] | length' 2>/dev/null) \
+    || die "repository verification output was malformed"
+((verify_non_display_failures == 0)) \
+    || die "repository verification found an in-scope mismatch"
+if ((verify_status != 0)); then
+    warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
+fi
+
+printf '%s\n' "$after_panel_sha" > "$recovery_path/after-appletsrc-sha256"
+sync -f "$recovery_path/after-appletsrc-sha256"
+printf 'complete\n' > "$recovery_path/complete"
+sync -f "$recovery_path/complete"
+trap - EXIT
+
+printf '\nChimera duplicate-tail recovery complete.\n'
+printf 'Removed applets: %s:%s, %s:%s (only when present)\n' \
+    "$STALE_RESOURCE_ID" "$STALE_RESOURCE_TYPE" \
+    "$STALE_ACTIVE_ID" "$STALE_ACTIVE_TYPE"
+printf 'Retained keeper IDs: %s\n' "$stable_order"
+printf 'Pre-recovery snapshot: %s\n' "$snapshot_path"
+printf 'Recovery receipt: %s\n' "$recovery_receipt"
+if [[ $topology_state == target11 ]]; then
+    printf 'Clean-target restore preview: %s\n' "$restore_preview"
+else
+    printf 'Offline-only restore preview: %s\n' "$restore_preview"
+fi
+printf 'No panel, keeper widget, display mode, wallpaper, task launcher, package, Plasma process, or KWin process was added, restarted, or removed.\n'

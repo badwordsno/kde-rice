@@ -7,13 +7,13 @@
             }
         ],
         "Category": "Windows and Tasks",
-        "Description": "Switch virtual desktops with compact numbered buttons",
+        "Description": "Switch virtual desktops with configurable labels and Chimera state cells",
         "EnabledByDefault": true,
         "Icon": "preferences-desktop-virtual",
         "Id": "org.kde.minimalist.workspaces",
         "License": "MIT",
         "Name": "Minimalist Workspaces",
-        "Version": "1.3"
+        "Version": "2.0"
     },
     "X-Plasma-API-Minimum-Version": "6.0"
 }

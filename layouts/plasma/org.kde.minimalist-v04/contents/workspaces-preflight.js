@@ -86,8 +86,10 @@ const geometryOk = exactGeometry(panel);
 const pagerKnown = knownWidgetTypes.indexOf(pagerType) !== -1;
 const workspaceKnown = knownWidgetTypes.indexOf(workspaceType) !== -1;
 let workspaceRevision = "none";
+let workspaceId = "none";
 if (topology === "minimalist-v04-workspaces") {
     const workspaceSwitcher = state.widgets[1];
+    workspaceId = String(workspaceSwitcher.id);
     const previousGroup = workspaceSwitcher.currentConfigGroup;
     workspaceSwitcher.currentConfigGroup = ["General"];
     workspaceRevision = String(workspaceSwitcher.readConfig("packageRevision", 0));
@@ -104,6 +106,7 @@ print(
     + " pagerKnown=" + pagerKnown
     + " workspaceKnown=" + workspaceKnown
     + " workspaceRevision=" + workspaceRevision
+    + " workspaceId=" + workspaceId
     + " widgets=" + (state.types.length ? state.types.join(";") : "none")
 );
 if (topology !== "unknown" && geometryOk && anchorReady && pagerKnown

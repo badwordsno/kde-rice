@@ -1,4 +1,4 @@
-# Independently authored black-minimal palette for kde-rice.
+# Independently authored Minimalist Black palette for kde-rice.
 
 [ColorEffects:Disabled]
 Color=72,72,78
@@ -23,8 +23,8 @@ IntensityEffect=0
 [Colors:Button]
 BackgroundAlternate=20,20,24
 BackgroundNormal=12,12,15
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=112,112,121
 ForegroundLink=183,181,190
@@ -37,8 +37,8 @@ ForegroundVisited=139,138,147
 [Colors:Complementary]
 BackgroundAlternate=12,12,15
 BackgroundNormal=0,0,0
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=112,112,121
 ForegroundLink=183,181,190
@@ -51,8 +51,8 @@ ForegroundVisited=139,138,147
 [Colors:Header]
 BackgroundAlternate=12,12,15
 BackgroundNormal=0,0,0
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=112,112,121
 ForegroundLink=183,181,190
@@ -65,8 +65,8 @@ ForegroundVisited=139,138,147
 [Colors:Header][Inactive]
 BackgroundAlternate=12,12,15
 BackgroundNormal=7,7,9
-DecorationFocus=104,50,183
-DecorationHover=125,71,205
+DecorationFocus=0,88,146
+DecorationHover=0,122,204
 ForegroundActive=158,157,168
 ForegroundInactive=88,88,96
 ForegroundLink=132,131,140
@@ -77,13 +77,13 @@ ForegroundPositive=89,141,110
 ForegroundVisited=111,110,118
 
 [Colors:Selection]
-BackgroundAlternate=119,44,232
-BackgroundNormal=145,70,255
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+BackgroundAlternate=0,100,167
+BackgroundNormal=0,122,204
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=255,255,255
 ForegroundInactive=218,218,223
-ForegroundLink=240,236,255
+ForegroundLink=240,240,255
 ForegroundNegative=255,218,222
 ForegroundNeutral=255,234,201
 ForegroundNormal=255,255,255
@@ -93,8 +93,8 @@ ForegroundVisited=240,223,235
 [Colors:Tooltip]
 BackgroundAlternate=20,20,24
 BackgroundNormal=12,12,15
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=132,132,141
 ForegroundLink=183,181,190
@@ -107,8 +107,8 @@ ForegroundVisited=139,138,147
 [Colors:View]
 BackgroundAlternate=11,11,14
 BackgroundNormal=0,0,0
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=112,112,121
 ForegroundLink=183,181,190
@@ -121,8 +121,8 @@ ForegroundVisited=139,138,147
 [Colors:Window]
 BackgroundAlternate=12,12,15
 BackgroundNormal=0,0,0
-DecorationFocus=145,70,255
-DecorationHover=169,112,255
+DecorationFocus=0,122,204
+DecorationHover=0,122,204
 ForegroundActive=183,181,190
 ForegroundInactive=112,112,121
 ForegroundLink=183,181,190
@@ -134,8 +134,8 @@ ForegroundVisited=139,138,147
 
 [General]
 ColorScheme=BlackMinimal
-Name=Black Minimal
-Name[ko]=블랙 미니멀
+Name=Minimalist Black
+Name[ko]=미니멀리스트 블랙
 shadeSortColumn=true
 
 [KDE]

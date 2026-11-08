@@ -7,13 +7,13 @@
             }
         ],
         "Category": "Windows and Tasks",
-        "Description": "Show the active window title as a compact panel text strip",
+        "Description": "Show and control the active window through a configurable Chimera title strip",
         "EnabledByDefault": true,
         "Icon": "preferences-system-windows",
         "Id": "org.kde.minimalist.activewindowtitle",
         "License": "MIT",
         "Name": "Minimalist Active Window Title",
-        "Version": "2.1"
+        "Version": "3.0"
     },
     "X-Plasma-API-Minimum-Version": "6.0"
 }

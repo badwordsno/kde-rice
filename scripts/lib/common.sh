@@ -2,7 +2,45 @@
 
 # Shared safety helpers. Caller scripts enable their own shell options.
 
-KDE_RICE_FORMAT_VERSION=1
+KDE_RICE_FORMAT_VERSION=2
+
+# Lock the existing home directory: no lock file is written before the baseline
+# snapshot. The open descriptor is inherited by nested transaction components.
+# flock locks the open description, so an inherited descriptor can be reused.
+acquire_managed_lock() {
+    local target_home=$1
+    local inherited=${KDE_RICE_LOCK_FD:-}
+    require_command flock
+    if [[ -n $inherited ]]; then
+        [[ $inherited =~ ^[0-9]+$ && $inherited -ge 10 \
+            && /proc/$BASHPID/fd/$inherited -ef $target_home ]] \
+            || die "invalid inherited managed-state lock"
+    else
+        exec {KDE_RICE_LOCK_FD}< "$target_home" \
+            || die "cannot open target home for managed-state locking"
+        export KDE_RICE_LOCK_FD
+    fi
+    flock -n "$KDE_RICE_LOCK_FD" \
+        || die "another kde-rice operation holds the managed-state lock; retry after it finishes"
+}
+
+# Hash a deterministic archive rather than following links or trusting paths
+# supplied by a checksum file. Includes directory entries, modes and link text.
+snapshot_content_digest() {
+    local root=$1
+    LC_ALL=C tar --sort=name --format=gnu --numeric-owner --owner=0 --group=0 \
+        --mtime='UTC 1970-01-01' -cf - -C "$root" -- \
+        format-version managed-paths.txt state.tsv payload \
+        | sha256sum | awk '{print $1}'
+}
+
+managed_path_digest() {
+    local root=$1
+    local relative=$2
+    LC_ALL=C tar --sort=name --format=gnu --numeric-owner --owner=0 --group=0 \
+        --mtime='UTC 1970-01-01' -cf - -C "$root" -- "$relative" \
+        | sha256sum | awk '{print $1}'
+}
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -15,6 +53,29 @@ warn() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# Component entry points share the same compatibility decision. Their callers
+# still validate home/test seams and perform their own exact topology checks.
+# Capture failure without changing the caller's errexit setting.
+require_component_diagnosis() {
+    local doctor_command=$1 target=$2 apply=$3 allow_degraded=$4 refusal=$5
+    local output status=0
+    [[ $apply == true || $apply == false ]] || die "invalid apply mode"
+    [[ $allow_degraded == true || $allow_degraded == false ]] || die "invalid degraded mode"
+    output=$("$doctor_command" --target "$target" 2>&1) || status=$?
+    printf '%s\n' "$output"
+    case "$status" in
+        0) ;;
+        1)
+            if [[ $apply == true && $allow_degraded != true ]]; then
+                die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
+            fi
+            warn "doctor reported degraded compatibility"
+            ;;
+        2) die "doctor reported unsupported; $refusal" ;;
+        *) die "doctor could not produce a trustworthy result (exit $status)" ;;
+    esac
 }
 
 resolve_dbus_tool() {

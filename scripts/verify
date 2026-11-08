@@ -13,6 +13,7 @@ RECEIPT=
 RESUME_RECEIPT=false
 JSON=false
 PANEL_TARGET=minimalist-v04
+EXPECTED_DESKTOPS=4
 PANEL_PROBE="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v02/contents/panel-state.js"
 
 usage() {
@@ -26,6 +27,7 @@ Options:
   --receipt PATH        Successful bootstrap receipt to verify
   --resume-receipt PATH Read-only check of a failed receipt after manual repair
   --panel-target NAME   Expected panel target (default: minimalist-v04)
+  --expected-desktops N Expected virtual-desktop count (default: 4; no setting change)
   --json                Emit one JSON document
   -h, --help            Show this help
 
@@ -67,6 +69,12 @@ while (($#)); do
             JSON=true
             shift
             ;;
+        --expected-desktops)
+            (($# >= 2)) || usage_error "--expected-desktops requires a count"
+            [[ $2 =~ ^[1-9][0-9]*$ ]] || usage_error "expected desktop count must be a positive integer"
+            EXPECTED_DESKTOPS=$2
+            shift 2
+            ;;
         --help | -h)
             usage
             exit 0
@@ -80,6 +88,12 @@ case "$PANEL_TARGET" in
         | minimalist-v04-workspaces) ;;
     *) usage_error "unsupported panel target: $PANEL_TARGET" ;;
 esac
+
+if [[ $EXPECTED_DESKTOPS != 4 ]]; then
+    [[ $PANEL_TARGET == minimalist-v04-pager || $PANEL_TARGET == minimalist-v04-workspaces ]] \
+        || usage_error "a custom desktop count requires a Pager or Workspaces target"
+    $RESUME_RECEIPT && usage_error "resume verification retains the four-desktop recovery contract"
+fi
 
 if ! command -v realpath >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1 \
     || ! command -v sha256sum >/dev/null 2>&1 || ! command -v diff >/dev/null 2>&1; then
@@ -152,6 +166,80 @@ read_kconfig() {
     kreadconfig6 --file "$file" --group "$group" --key "$key" 2>/dev/null
 }
 
+read_persistent_panel_topology() {
+    local file=$1 panel_id=$2
+
+    awk -v panel_id="$panel_id" '
+        BEGIN {
+            panel_general = "[Containments][" panel_id "][General]"
+            direct_prefix = "[Containments][" panel_id "][Applets]["
+            section_kind = "other"
+            direct_id = ""
+        }
+
+        /^\[/ {
+            section_kind = "other"
+            direct_id = ""
+            if ($0 == panel_general) {
+                section_kind = "general"
+                next
+            }
+            if (index($0, direct_prefix) == 1) {
+                suffix = substr($0, length(direct_prefix) + 1)
+                if (suffix ~ /^[0-9]+\]$/) {
+                    sub(/\]$/, "", suffix)
+                    section_kind = "direct"
+                    direct_id = suffix
+                }
+            }
+            next
+        }
+
+        section_kind == "general" && /^AppletOrder=/ {
+            ++order_count
+            order = substr($0, length("AppletOrder=") + 1)
+            next
+        }
+
+        section_kind == "direct" && /^plugin=/ {
+            ++plugin_count[direct_id]
+            plugin[direct_id] = substr($0, length("plugin=") + 1)
+        }
+
+        END {
+            if (order_count != 1 || order == "") {
+                printf "disk-AppletOrder-count=%d\n", order_count
+                exit 4
+            }
+            order_length = split(order, ids, ";")
+            if (order_length < 1) {
+                print "disk-AppletOrder-empty"
+                exit 4
+            }
+            canonical = ""
+            for (position = 1; position <= order_length; ++position) {
+                id = ids[position]
+                if (id !~ /^[0-9]+$/ || seen_order[id]++) {
+                    print "disk-AppletOrder-invalid"
+                    exit 4
+                }
+                if (plugin_count[id] != 1 || plugin[id] == "") {
+                    printf "disk-direct-plugin-missing-or-duplicate=%s\n", id
+                    exit 4
+                }
+                canonical = canonical (canonical == "" ? "" : ";") id "=" plugin[id]
+            }
+            for (id in plugin_count) {
+                if (plugin_count[id] != 1 || !(id in seen_order)) {
+                    printf "disk-extra-or-duplicate-direct-plugin=%s\n", id
+                    exit 4
+                }
+            }
+            printf "%s\t%s\t%s\n", panel_id, order, canonical
+        }
+    ' "$file"
+}
+
 if ! command -v kreadconfig6 >/dev/null 2>&1; then
     printf 'error: kreadconfig6 is unavailable\n' >&2
     exit 2
@@ -174,8 +262,8 @@ decoration_library=${decoration_library:-org.kde.breeze}
 decoration_theme=${decoration_theme:-Breeze}
 [[ $color == BlackMinimal ]] && value=true || value=false
 add_check color_scheme "$value" BlackMinimal "${color:-missing}"
-[[ $selection == 145,70,255 ]] && value=true || value=false
-add_check selection_color "$value" 145,70,255 "${selection:-missing}"
+[[ $selection == 0,122,204 ]] && value=true || value=false
+add_check selection_color "$value" 0,122,204 "${selection:-missing}"
 [[ $profile == BlackMinimal.profile ]] && value=true || value=false
 add_check konsole_default_profile "$value" BlackMinimal.profile "${profile:-missing}"
 [[ $plasma_theme == default ]] && value=true || value=false
@@ -296,6 +384,14 @@ panel_marker=$(printf '%s\n' "$panel_raw" | sed -n '/^KDE_RICE_PANEL_STATE /{p;q
     printf 'error: plasmashell returned an unrecognized verification result\n' >&2
     exit 2
 }
+if ! command -v jq >/dev/null 2>&1; then
+    printf 'error: jq is required to verify persistent panel topology\n' >&2
+    exit 2
+fi
+printf '%s\n' "$panel_json" | jq -e 'type == "object"' >/dev/null 2>&1 || {
+    printf 'error: plasmashell returned malformed panel JSON\n' >&2
+    exit 2
+}
 
 panel_count=$(marker_field "$panel_marker" panelCount) || exit 2
 signature=$(marker_field "$panel_marker" signature) || exit 2
@@ -375,6 +471,65 @@ fi
 add_check required_live_widgets "$live_widgets" available \
     "target=$known_target_widgets built-ins=$known_built_in_widgets icon-tasks=$icon_tasks_known pager=$pager_known workspaces=$workspace_switcher_known"
 
+persistent_panel_ok=false
+persistent_panel_expected='live AppletOrder IDs/types equal disk direct Applets plugins'
+persistent_panel_actual='live-panel-json-incomplete'
+live_persistent_topology=$(printf '%s\n' "$panel_json" | jq -er '
+    def scalar_id:
+        if type == "number" or type == "string" then tostring else empty end;
+    .panels
+    | select(type == "array" and length == 1)
+    | .[0] as $panel
+    | ($panel.id | scalar_id) as $panel_id
+    | ($panel.applet_order | select(type == "string" and length > 0)) as $order
+    | ($order | split(";")) as $ids
+    | ($panel.widget_entries
+        | select(type == "array")
+        | map({id: (.id | scalar_id), type: (.type | select(type == "string" and length > 0))})
+      ) as $entries
+    | select($panel_id | test("^[0-9]+$"))
+    | select(($ids | length) > 0 and all($ids[]; test("^[0-9]+$")))
+    | select(($ids | unique | length) == ($ids | length))
+    | select(($entries | length) == ($ids | length))
+    | select(($entries | map(.id) | unique | length) == ($entries | length))
+    | select(($entries | map(.id) | sort) == ($ids | sort))
+    | [
+        $panel_id,
+        $order,
+        ([$ids[] as $id
+            | $entries[]
+            | select(.id == $id)
+            | (.id + "=" + .type)
+         ] | join(";"))
+      ]
+    | @tsv
+' 2>/dev/null || true)
+if [[ -n $live_persistent_topology ]]; then
+    IFS=$'\t' read -r live_panel_id live_panel_order live_panel_entries \
+        <<< "$live_persistent_topology"
+    panel_config="$TARGET_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    if [[ -f $panel_config && ! -L $panel_config && -r $panel_config ]]; then
+        disk_persistent_topology=
+        if disk_persistent_topology=$(read_persistent_panel_topology \
+            "$panel_config" "$live_panel_id" 2>&1); then
+            IFS=$'\t' read -r disk_panel_id disk_panel_order disk_panel_entries \
+                <<< "$disk_persistent_topology"
+            if [[ $disk_panel_id == "$live_panel_id" \
+                && $disk_panel_order == "$live_panel_order" \
+                && $disk_panel_entries == "$live_panel_entries" ]]; then
+                persistent_panel_ok=true
+            fi
+            persistent_panel_actual="live=$live_panel_id:$live_panel_order:$live_panel_entries disk=$disk_panel_id:$disk_panel_order:$disk_panel_entries"
+        else
+            persistent_panel_actual=${disk_persistent_topology:-disk-panel-topology-invalid}
+        fi
+    else
+        persistent_panel_actual='panel-config-missing-or-unsafe'
+    fi
+fi
+add_check persistent_panel_topology "$persistent_panel_ok" \
+    "$persistent_panel_expected" "$persistent_panel_actual"
+
 if [[ $PANEL_TARGET == minimalist-v04-pager \
     || $PANEL_TARGET == minimalist-v04-workspaces ]]; then
     if ! command -v jq >/dev/null 2>&1; then
@@ -412,9 +567,9 @@ if [[ $PANEL_TARGET == minimalist-v04-pager \
         printf 'error: KWin virtual-desktop rows reply was malformed\n' >&2
         exit 2
     }
-    [[ $kwin_count == 4 ]] && desktops_ok=true || desktops_ok=false
+    [[ $kwin_count == "$EXPECTED_DESKTOPS" ]] && desktops_ok=true || desktops_ok=false
     [[ $kwin_rows == 1 ]] && rows_ok=true || rows_ok=false
-    add_check virtual_desktop_count "$desktops_ok" 4 "$kwin_count"
+    add_check virtual_desktop_count "$desktops_ok" "$EXPECTED_DESKTOPS" "$kwin_count"
     add_check virtual_desktop_rows "$rows_ok" 1 "$kwin_rows"
 fi
 
@@ -513,9 +668,19 @@ fi
 add_check display_configuration_unchanged "$display_ok" "bootstrap fingerprint" "$display_actual"
 
 overall=true
-for ok in "${check_ok[@]}"; do
-    [[ $ok == true ]] || overall=false
+managed_ok=true
+for index in "${!check_ok[@]}"; do
+    if [[ ${check_ok[$index]} != true ]]; then
+        overall=false
+        [[ ${check_names[$index]} == display_configuration_unchanged ]] || managed_ok=false
+    fi
 done
+case "$display_actual" in
+    'bootstrap changed excluded display fingerprint') display_status=changed_during_apply ;;
+    'differs from bootstrap receipt') display_status=changed_since_receipt ;;
+    'differs from failed-receipt baseline') display_status=changed_since_failed_baseline ;;
+    *) display_status=unchanged ;;
+esac
 
 json_escape() {
     local value=$1
@@ -547,7 +712,9 @@ json_escape() {
 }
 
 if $JSON; then
-    printf '{"schema_version":1,"status":"%s","checks":[' "$($overall && printf verified || printf mismatch)"
+    printf '{"schema_version":1,"status":"%s","summary":{"managed_state":"%s","display_state":"%s"},"checks":[' \
+        "$($overall && printf verified || printf mismatch)" \
+        "$($managed_ok && printf verified || printf mismatch)" "$display_status"
     for index in "${!check_names[@]}"; do
         ((index == 0)) || printf ','
         printf '{"name":"%s","ok":%s,"expected":"%s","actual":"%s"}' \
@@ -569,6 +736,13 @@ else
             "$([[ ${check_ok[$index]} == true ]] && printf PASS || printf FAIL)" \
             "${check_names[$index]}" "${check_expected[$index]}" "${check_actual[$index]}"
     done
+    printf 'Managed state: %s; excluded display state: %s\n' \
+        "$($managed_ok && printf VERIFIED || printf MISMATCH)" "$display_status"
+    if [[ $display_status == changed_since_receipt ]]; then
+        printf 'The receipt records unchanged displays during apply, but the current fingerprint differs.\n'
+        printf 'This comparison cannot identify who changed it or whether the change was intentional.\n'
+        printf 'Review subsequent display changes; reapplying the theme is not a display repair.\n'
+    fi
     printf 'Read-only: no Plasma, KWin, Konsole, panel, or display setting was written.\n'
 fi
 

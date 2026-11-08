@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Layouts
 
@@ -10,26 +12,39 @@ import org.kde.plasma.plasmoid
 import org.kde.plasma.workspace.dbus as DBus
 import org.kde.taskmanager as TaskManager
 
+import "chimera" as Chimera
+
 PlasmoidItem {
     id: root
 
-    readonly property real horizontalPadding: Kirigami.Units.smallSpacing
-    readonly property real buttonSpacing: 1
+    readonly property real horizontalPadding: tokens.space2
+    readonly property real buttonSpacing: tokens.flatSurface ? 0 : tokens.cellGap
     readonly property real buttonWidth: Math.round(Kirigami.Units.gridUnit * 1.25)
+    readonly property real configuredButtonWidth: Number(
+        Plasmoid.configuration.labelMode) === 1
+        ? Math.round(Kirigami.Units.gridUnit * 6)
+        : Number(Plasmoid.configuration.density) === 1
+            ? Math.round(Kirigami.Units.gridUnit * 1.5) : buttonWidth
     readonly property real preferredSwitcherWidth: horizontalPadding * 2
-        + buttonWidth * desktopInfo.numberOfDesktops
+        + configuredButtonWidth * desktopInfo.numberOfDesktops
         + buttonSpacing * Math.max(0, desktopInfo.numberOfDesktops - 1)
+    readonly property bool hiddenByPolicy: Boolean(Plasmoid.configuration.hideWhenSingle)
+        && desktopInfo.numberOfDesktops <= 1
     property int wheelDelta: 0
 
     preferredRepresentation: fullRepresentation
 
-    Layout.minimumWidth: preferredSwitcherWidth
-    Layout.preferredWidth: preferredSwitcherWidth
-    Layout.maximumWidth: preferredSwitcherWidth
-    Layout.fillHeight: true
+    Layout.minimumWidth: hiddenByPolicy ? 0 : preferredSwitcherWidth
+    Layout.preferredWidth: hiddenByPolicy ? 0 : preferredSwitcherWidth
+    Layout.maximumWidth: hiddenByPolicy ? 0 : preferredSwitcherWidth
+    Layout.minimumHeight: tokens.controlHeight
+    Layout.preferredHeight: tokens.controlHeight
+    Layout.maximumHeight: tokens.controlHeight
+    Layout.fillHeight: false
 
+    visible: !hiddenByPolicy
     Plasmoid.backgroundHints: PlasmaCore.Types.NoBackground
-    Plasmoid.status: desktopInfo.numberOfDesktops > 1
+    Plasmoid.status: !hiddenByPolicy && desktopInfo.numberOfDesktops > 1
         ? PlasmaCore.Types.ActiveStatus
         : PlasmaCore.Types.PassiveStatus
 
@@ -53,6 +68,18 @@ PlasmoidItem {
         return candidate === undefined || String(candidate) === ""
             ? qsTr("Desktop %1").arg(index + 1)
             : String(candidate);
+    }
+
+    function desktopLabel(index) {
+        switch (Math.max(0, Math.min(2,
+                Number(Plasmoid.configuration.labelMode)))) {
+        case 1:
+            return desktopName(index);
+        case 2:
+            return "•";
+        default:
+            return String(index + 1);
+        }
     }
 
     function switchDesktopSteps(member, remaining) {
@@ -94,9 +121,24 @@ PlasmoidItem {
         if (count < 2) {
             return;
         }
-        const target = Math.max(0, Math.min(count - 1,
-            currentDesktopIndex() + direction));
+        let target = currentDesktopIndex() + direction;
+        if (Plasmoid.configuration.wrapWheel) {
+            target = (target + count) % count;
+        } else {
+            target = Math.max(0, Math.min(count - 1, target));
+        }
         switchToDesktop(target);
+    }
+
+    Chimera.ChimeraTokens {
+        id: tokens
+
+        density: Math.max(0, Math.min(1, Number(Plasmoid.configuration.density)))
+        surfaceStyle: Math.max(0, Math.min(2,
+            Number(Plasmoid.configuration.surfaceStyle)))
+        bevelDepth: Math.max(0, Math.min(2,
+            Number(Plasmoid.configuration.bevelDepth)))
+        motionEnabled: Boolean(Plasmoid.configuration.motionEnabled)
     }
 
     TaskManager.VirtualDesktopInfo {
@@ -105,13 +147,15 @@ PlasmoidItem {
 
     fullRepresentation: Item {
         implicitWidth: root.preferredSwitcherWidth
-        implicitHeight: Kirigami.Units.gridUnit
+        implicitHeight: tokens.controlHeight
 
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.NoButton
             onWheel: wheel => {
-                root.wheelDelta += wheel.angleDelta.y || wheel.angleDelta.x;
+                const rawDelta = wheel.angleDelta.y || wheel.angleDelta.x;
+                root.wheelDelta += Plasmoid.configuration.invertWheel
+                    ? -rawDelta : rawDelta;
 
                 while (root.wheelDelta >= 120) {
                     root.wheelDelta -= 120;
@@ -139,45 +183,49 @@ PlasmoidItem {
                     required property int index
                     readonly property bool current: index === root.currentDesktopIndex()
 
-                    Layout.minimumWidth: root.buttonWidth
-                    Layout.preferredWidth: root.buttonWidth
-                    Layout.maximumWidth: root.buttonWidth
+                    Layout.minimumWidth: root.configuredButtonWidth
+                    Layout.preferredWidth: root.configuredButtonWidth
+                    Layout.maximumWidth: root.configuredButtonWidth
                     Layout.fillHeight: true
 
                     mainText: root.desktopName(index)
                     subText: current ? qsTr("Current desktop") : qsTr("Switch desktop")
 
-                    Rectangle {
+                    Chimera.ChimeraFrame {
                         anchors.fill: parent
-                        anchors.topMargin: Kirigami.Units.smallSpacing / 2
-                        anchors.bottomMargin: Kirigami.Units.smallSpacing / 2
-                        anchors.leftMargin: 1
-                        anchors.rightMargin: 1
 
-                        radius: 2
-                        color: desktopButton.current
-                            ? Kirigami.Theme.highlightColor
-                            : Kirigami.Theme.textColor
-                        opacity: desktopButton.current ? 0.72
-                            : desktopMouseArea.containsMouse ? 0.12 : 0
+                        tokens: tokens
+                        active: desktopButton.current
+                        hovered: desktopMouseArea.containsMouse
+                        pressed: desktopMouseArea.pressed
+                        focused: desktopMouseArea.activeFocus
+                        stateRailInset: Math.max(tokens.space2,
+                            Math.floor((root.configuredButtonWidth
+                                - tokens.space4) / 2))
+                        fillColor: pressed ? tokens.surfaceSunken
+                            : hovered ? tokens.surfaceHovered
+                            : tokens.flatSurface ? "transparent"
+                            : desktopButton.current
+                            ? Qt.tint(tokens.surfaceRaised,
+                                Qt.rgba(tokens.accent.r, tokens.accent.g,
+                                    tokens.accent.b, 0.2))
+                            : tokens.surfaceRaised
 
-                        Behavior on opacity {
-                            NumberAnimation { duration: Kirigami.Units.shortDuration }
+                        PlasmaComponents.Label {
+                            anchors.fill: parent
+
+                            text: root.desktopLabel(desktopButton.index)
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                            maximumLineCount: 1
+                            font.family: "Noto Sans"
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            // Selection is carried by the fill and rail;
+                            // small labels retain the normal text contrast.
+                            color: tokens.textColor
                         }
-                    }
-
-                    PlasmaComponents.Label {
-                        anchors.fill: parent
-
-                        text: String(desktopButton.index + 1)
-                        textFormat: Text.PlainText
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        font.family: "Noto Sans"
-                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                        color: desktopButton.current
-                            ? Kirigami.Theme.highlightedTextColor
-                            : Kirigami.Theme.textColor
                     }
 
                     MouseArea {

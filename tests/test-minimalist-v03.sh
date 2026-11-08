@@ -24,6 +24,7 @@ fail() {
 
 LAYOUT="$REPO_ROOT/layouts/plasma/org.kde.minimalist-v03"
 PLASMOID="$REPO_ROOT/plasmoids/org.kde.minimalist.resources"
+VOLUME_PROVIDER="$PLASMOID/contents/ui/providers/VolumeProvider.qml"
 APPLY_SCRIPT="$REPO_ROOT/scripts/apply-minimalist-v03"
 TARGET_HOME="$TEMP_ROOT/home"
 MOCK_BIN="$TEMP_ROOT/bin"
@@ -35,6 +36,8 @@ mkdir -p -- "$TARGET_HOME" "$MOCK_BIN"
 bash -n "$APPLY_SCRIPT"
 "$QMLLINT_BIN" -I "$QML_IMPORT_ROOT" "$PLASMOID/contents/ui/main.qml" \
     || fail "resource Plasmoid QML validation failed"
+"$QMLLINT_BIN" -I "$QML_IMPORT_ROOT" "$VOLUME_PROVIDER" \
+    || fail "isolated volume-provider QML validation failed"
 
 grep -Fq '"Id": "org.kde.minimalist-v03"' "$LAYOUT/metadata.json" \
     || fail "v0.3 layout package ID is wrong"
@@ -54,11 +57,16 @@ grep -Fq 'sensorId: "cpu/all/usage"' "$PLASMOID/contents/ui/main.qml" \
     || fail "aggregate CPU sensor is missing"
 grep -Fq 'sensorId: "memory/physical/usedPercent"' "$PLASMOID/contents/ui/main.qml" \
     || fail "physical-memory percentage sensor is missing"
-grep -Fq 'import org.kde.plasma.private.volume' "$PLASMOID/contents/ui/main.qml" \
+if grep -Fq 'import org.kde.plasma.private.volume' "$PLASMOID/contents/ui/main.qml"; then
+    fail "private volume import can still disable the entire resource strip"
+fi
+grep -Fq 'source: "providers/VolumeProvider.qml"' "$PLASMOID/contents/ui/main.qml" \
+    || fail "the volume backend is not isolated behind a Loader"
+grep -Fq 'import org.kde.plasma.private.volume' "$VOLUME_PROVIDER" \
     || fail "event-driven KDE volume backend import is missing"
-grep -Fq 'readonly property var outputSink: PreferredDevice.sink' "$PLASMOID/contents/ui/main.qml" \
+grep -Fq 'readonly property var sink: PreferredDevice.sink' "$VOLUME_PROVIDER" \
     || fail "preferred output device binding is missing"
-grep -Fq 'Number(PulseAudio.NormalVolume)' "$PLASMOID/contents/ui/main.qml" \
+grep -Fq 'Number(PulseAudio.NormalVolume)' "$VOLUME_PROVIDER" \
     || fail "native PulseAudioQt volume normalization is missing"
 grep -Fq 'text: "RAM " + root.paddedPercentage(memory)' "$PLASMOID/contents/ui/main.qml" \
     || fail "memory label was not renamed to RAM"
@@ -76,15 +84,15 @@ grep -Fq 'readonly property int sensorUpdateLimit: 2000' "$PLASMOID/contents/ui/
     || fail "resource polling limit is not two seconds"
 grep -Fq 'readonly property real stableLabelWidth:' "$PLASMOID/contents/ui/main.qml" \
     || fail "resource labels do not reserve a stable maximum width"
-grep -Fq 'text: "CPU 100%"' "$PLASMOID/contents/ui/main.qml" \
-    || fail "resource width is not measured against a three-digit percentage"
+grep -Fq 'labelMetrics.advanceWidth("RAM 100%")' "$PLASMOID/contents/ui/main.qml" \
+    || fail "resource width does not include the widest metric label"
 grep -Fq 'function paddedPercentage(sensor)' "$PLASMOID/contents/ui/main.qml" \
     || fail "resource percentages are not padded against digit-count jitter"
 if rg -n 'Layout\.(minimumWidth|preferredWidth|maximumWidth): metrics\.' \
     "$PLASMOID/contents/ui/main.qml" >/dev/null; then
     fail "resource root still references a deferred representation ID"
 fi
-grep -Fq '"$DOCTOR_COMMAND" --target minimalist-v03' "$APPLY_SCRIPT" \
+grep -Fq 'require_component_diagnosis "$DOCTOR_COMMAND" minimalist-v03' "$APPLY_SCRIPT" \
     || fail "v0.3 apply does not request the v0.3 doctor capability target"
 "$NODE_BIN" - "$PLASMOID/contents/ui/main.qml" <<'NODE'
 const fs = require("fs");
@@ -95,10 +103,10 @@ if (!functions) process.exit(1);
 const context = {Math, Number, Sensors: {Sensor: {Ready: 1}}};
 vm.runInNewContext(functions[0].replace(/^    /gm, ""), context);
 const cases = [
-    [{status: 0, value: 0}, "  --"],
-    [{status: 1, value: 0}, "  0%"],
-    [{status: 1, value: 9.4}, "  9%"],
-    [{status: 1, value: 10}, " 10%"],
+    [{status: 0, value: 0}, "\u2007\u2007--"],
+    [{status: 1, value: 0}, "\u2007\u20070%"],
+    [{status: 1, value: 9.4}, "\u2007\u20079%"],
+    [{status: 1, value: 10}, "\u200710%"],
     [{status: 1, value: 99.6}, "100%"],
     [{status: 1, value: 110}, "100%"]
 ];
@@ -116,15 +124,15 @@ if (!functions) process.exit(1);
 const context = {
     Math,
     Number,
-    PulseAudio: {NormalVolume: 65536},
+    root: {normalVolume: 65536},
     volumeAvailable: false,
     outputSink: {volume: 0}
 };
 vm.runInNewContext(functions[0].replace(/^    /gm, ""), context);
 const cases = [
-    [false, 0, " --%"],
-    [true, 0, "  0%"],
-    [true, 32768, " 50%"],
+    [false, 0, "\u2007--%"],
+    [true, 0, "\u2007\u20070%"],
+    [true, 32768, "\u200750%"],
     [true, 65536, "100%"],
     [true, 98304, "150%"],
     [true, 9999999, "999%"]

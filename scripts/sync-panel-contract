@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+MODE=--check
+SOURCE_ROOT=$REPO_ROOT
+while (($#)); do
+    case "$1" in
+        --check | --write) MODE=$1; shift ;;
+        --source)
+            [[ $# -ge 2 ]] || { printf 'error: --source requires a path\n' >&2; exit 64; }
+            SOURCE_ROOT=$2; shift 2 ;;
+        -h | --help)
+            printf 'Usage: scripts/sync-panel-contract [--check|--write] [--source ABSOLUTE_PATH]\nChecks generated panel constants by default; --write updates only the five marked source blocks.\n'
+            exit 0 ;;
+        *) printf 'error: unknown argument: %s\n' "$1" >&2; exit 64 ;;
+    esac
+done
+command -v python3 >/dev/null 2>&1 || { printf 'error: python3 is required for panel source generation/checks\n' >&2; exit 1; }
+python3 - "$SOURCE_ROOT" "$MODE" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mode = sys.argv[2]
+
+def fail(message):
+    sys.exit("error: " + message)
+
+if not root.is_absolute() or not root.is_dir() or root.resolve() != root:
+    fail("source must be an absolute directory without symlink components")
+
+def source(relative):
+    path = root / relative
+    if not path.is_file() or path.resolve() != path:
+        fail("missing or unsafe panel source: " + relative)
+    return path
+
+try:
+    contract = json.loads(source("design/panel/v04.json").read_text())
+except (ValueError, OSError) as error:
+    fail("cannot read panel contract: " + str(error))
+if not isinstance(contract, dict) or set(contract) != {"schemaVersion", "widgets", "roles", "sequences"} or contract["schemaVersion"] != 2:
+    fail("unsupported panel contract schema")
+widgets = contract["widgets"]
+roles = contract["roles"]
+sequences = contract["sequences"]
+if not all(isinstance(value, dict) for value in (widgets, roles, sequences)):
+    fail("panel widgets, roles, and sequences must be objects")
+for key, value in widgets.items():
+    if not re.fullmatch(r"[a-zA-Z]+", key) or not isinstance(value, str) or not re.fullmatch(r"org\.[a-zA-Z0-9_.]+", value):
+        fail("invalid panel widget identity")
+if len(set(widgets.values())) != len(widgets):
+    fail("panel widget identities must be distinct")
+
+# Consumer operations give these roles their meaning: both spacers expand,
+# tasks receive task policy, resources receive a package revision, and so on.
+# Keep this type contract independent of the authored sequence order.
+required_roles = {key: key for key in (
+    "launcher", "title", "tasks", "resources", "margin", "input", "tray",
+    "clock", "pager", "workspaces"
+)}
+required_roles.update(leftSpacer="spacer", rightSpacer="spacer")
+if roles != required_roles or set(widgets) != set(required_roles.values()):
+    fail("invalid panel role/type bindings")
+base_roles = {"launcher", "title", "leftSpacer", "resources", "margin", "input", "tray", "clock"}
+staged_roles = base_roles | {"rightSpacer"}
+final_roles = staged_roles | {"tasks"}
+required_sequences = {
+    "v03Widgets": base_roles,
+    "stagedWidgets": staged_roles,
+    "taskFrontStagedWidgets": final_roles,
+    "v04Widgets": final_roles,
+    "v04PagerWidgets": final_roles | {"pager"},
+    "v04WorkspacesWidgets": final_roles | {"workspaces"},
+}
+if set(sequences) != set(required_sequences):
+    fail("invalid panel sequence names")
+for key, value in sequences.items():
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(item, str) or item not in roles for item in value)
+            or len(set(value)) != len(value) or set(value) != required_sequences[key]):
+        fail("invalid panel sequence: " + key)
+
+# Live placement inserts before a settled anchor; cleanup only removes the
+# additions. A valid role map alone must not authorize a different transition.
+staged = sequences["stagedWidgets"]
+final = sequences["v04Widgets"]
+if ([role for role in staged if role != "rightSpacer"] != sequences["v03Widgets"]
+        or staged.index("rightSpacer") + 1 != staged.index("resources")
+        or staged.index("leftSpacer") + 1 != staged.index("rightSpacer")
+        or sequences["taskFrontStagedWidgets"] != ["tasks"] + staged
+        or [role for role in final if role != "tasks"] != staged
+        or final.index("tasks") + 1 != final.index("rightSpacer")
+        or [role for role in sequences["v04PagerWidgets"] if role != "pager"] != final
+        or [role for role in sequences["v04WorkspacesWidgets"] if role != "workspaces"] != final):
+    fail("panel sequences do not preserve the supported insertion/cleanup transitions")
+
+# Binding names belong to the independent consumers. Only data is generated;
+# never move observation, mutation, acceptance, or rollback logic into here.
+common = [("spacerType", "spacer"), ("taskType", "tasks"), ("resourceType", "resources")]
+optional = [("pagerType", "pager"), ("workspaceType", "workspaces")]
+base = [("v03Widgets", "v03Widgets"), ("stagedWidgets", "stagedWidgets")]
+final = [("targetWidgets", "v04Widgets"), ("pagerTargetWidgets", "v04PagerWidgets"), ("workspacesTargetWidgets", "v04WorkspacesWidgets")]
+consumers = {
+    "preflight.js": (common + optional, base + [("taskFrontStagedWidgets", "taskFrontStagedWidgets"), ("v04Widgets", "v04Widgets"), ("v04PagerWidgets", "v04PagerWidgets"), ("v04WorkspacesWidgets", "v04WorkspacesWidgets")]),
+    "stage-spacer.js": ([common[0], common[2]], base),
+    "layout.js": (common + [("clockType", "clock")] + optional, [base[1]] + final),
+    "cleanup.js": (common, base + [("taskFrontWidgets", "taskFrontStagedWidgets"), final[0]]),
+    "postcheck.js": (common + [("clockType", "clock")] + optional, [("expected", "v04Widgets"), ("pagerExpected", "v04PagerWidgets"), ("workspacesExpected", "v04WorkspacesWidgets")]),
+}
+begin = "// BEGIN GENERATED PANEL CONSTANTS"
+end = "// END GENERATED PANEL CONSTANTS"
+pending = []
+for name, (types, arrays) in consumers.items():
+    path = source("layouts/plasma/org.kde.minimalist-v04/contents/" + name)
+    old = path.read_text()
+    if old.count(begin) != 1 or old.count(end) != 1 or old.index(begin) >= old.index(end):
+        fail("invalid generated block markers: " + name)
+    lines = [begin]
+    try:
+        for variable, key in types:
+            lines.append("const " + variable + " = " + json.dumps(widgets[key]) + ";")
+        for variable, key in arrays:
+            values = [json.dumps(widgets[roles[item]]) for item in sequences[key]]
+            lines.append("const " + variable + " = [\n    " + ",\n    ".join(values) + "\n];")
+            positions = {role: index for index, role in enumerate(sequences[key])}
+            lines.append("const " + variable + "Positions = " + json.dumps(positions, indent=4) + ";")
+    except KeyError as error:
+        fail("missing panel contract entry: " + str(error))
+    lines.append(end)
+    new = old[:old.index(begin)] + "\n".join(lines) + old[old.index(end) + len(end):]
+    if new != old:
+        pending.append((path, new))
+# Validate every destination before writing any source file.
+if mode == "--check" and pending:
+    fail("stale generated panel constants: " + ", ".join(path.name for path, _ in pending))
+for path, text in pending:
+    path.write_text(text)
+print("Panel contract constants are " + ("synchronized." if mode == "--write" else "current."))
+PY

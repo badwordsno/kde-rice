@@ -61,7 +61,14 @@ const projectWidgetsOk = !!workspace && !!activeTitle && !!resources
     && String(readConfig(resources, "General", "packageRevision", 0)) === "2"
     && String(readConfig(activeTitle, "General", "fontPolicyRevision", 0)) === "2"
     && String(readConfig(workspace, "General", "fontPolicyRevision", 0)) === "2"
-    && String(readConfig(resources, "General", "fontPolicyRevision", 0)) === "2";
+    && String(readConfig(resources, "General", "fontPolicyRevision", 0)) === "2"
+    && String(readConfig(activeTitle, "General", "chimeraUiRevision", 0)) === "2"
+    && String(readConfig(workspace, "General", "chimeraUiRevision", 0)) === "2"
+    && String(readConfig(resources, "General", "chimeraUiRevision", 0)) === "2";
+const projectGeometryOk = !!workspace && !!activeTitle && !!resources
+    && workspace.geometry.y === 4 && workspace.geometry.height === 24
+    && activeTitle.geometry.y === 4 && activeTitle.geometry.height === 24
+    && resources.geometry.y === 4 && resources.geometry.height === 24;
 const clockOk = !!clock
     && String(readConfig(clock, "Appearance", "fontFamily", "missing")) === "Noto Sans"
     && ["false", "0"].indexOf(String(readConfig(clock, "Appearance", "autoFontAndSize", "missing"))) !== -1
@@ -75,9 +82,10 @@ print(
     + " topologyOk=" + topologyOk
     + " geometryOk=" + geometryOk
     + " projectWidgetsOk=" + projectWidgetsOk
+    + " projectGeometryOk=" + projectGeometryOk
     + " clockOk=" + clockOk
     + " widgets=" + (state.types.length ? state.types.join(";") : "none")
 );
-if (topologyOk && geometryOk && projectWidgetsOk && clockOk) {
+if (topologyOk && geometryOk && projectWidgetsOk && projectGeometryOk && clockOk) {
     print(" MINIMALIST_FONT_POSTCHECK_OK");
 }

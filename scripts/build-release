@@ -4,13 +4,13 @@ set -Eeuo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 OUTPUT_DIR=$REPO_ROOT/dist
-SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-315532800}
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
 
 usage() {
     cat <<'EOF'
 Usage: scripts/build-release [OPTIONS]
 
-Build both versioned public artifacts and one SHA256SUMS file.
+Build the versioned public source archive and SHA256SUMS.
 
 Options:
   --output PATH  Output directory (default: ./dist)
@@ -40,9 +40,9 @@ while (($#)); do
     esac
 done
 
-[[ $SOURCE_DATE_EPOCH =~ ^[0-9]+$ && $SOURCE_DATE_EPOCH -ge 315532800 ]] \
-    || die "SOURCE_DATE_EPOCH must be an integer on or after 1980-01-01"
-for builder in "$SCRIPT_DIR/build-store-release" "$SCRIPT_DIR/build-extended-release"; do
+[[ $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]] \
+    || die "SOURCE_DATE_EPOCH must be a non-negative integer"
+for builder in "$SCRIPT_DIR/build-source-release"; do
     [[ -x $builder && ! -L $builder ]] || die "release builder is unavailable: $builder"
 done
 for command_name in realpath mkdir mktemp install sha256sum sort xargs; do
@@ -61,14 +61,11 @@ OUTPUT_DIR=$(realpath -e -- "$OUTPUT_DIR") || die "output directory could not be
 [[ ! -L $OUTPUT_DIR/SHA256SUMS ]] || die "refusing to replace a symlinked SHA256SUMS"
 
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH \
-    "$SCRIPT_DIR/build-store-release" --output "$OUTPUT_DIR"
-SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH \
-    "$SCRIPT_DIR/build-extended-release" --output "$OUTPUT_DIR"
+    "$SCRIPT_DIR/build-source-release" --output "$OUTPUT_DIR"
 
 version=$(< "$REPO_ROOT/VERSION")
 artifacts=(
-    "minimalist-black-kde-extended-$version.tar.xz"
-    "minimalist-black-plasma6-$version.zip"
+    "minimalist-black-kde-$version.tar.xz"
 )
 for artifact in "${artifacts[@]}"; do
     [[ -f $OUTPUT_DIR/$artifact && ! -L $OUTPUT_DIR/$artifact ]] \

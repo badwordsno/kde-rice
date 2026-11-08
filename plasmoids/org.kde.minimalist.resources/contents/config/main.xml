@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="metricOrder" type="String">
+      <default>CPU,RAM,GPU,VOL</default>
+    </entry>
+    <entry name="showCpu" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showMemory" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showGpu" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showVolume" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="updateRateMs" type="Int">
+      <default>2000</default>
+      <min>250</min>
+      <max>10000</max>
+    </entry>
+    <entry name="warningPercent" type="Int">
+      <default>70</default>
+      <min>1</min>
+      <max>99</max>
+    </entry>
+    <entry name="criticalPercent" type="Int">
+      <default>90</default>
+      <min>2</min>
+      <max>100</max>
+    </entry>
+    <entry name="showStateRails" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="density" type="Int">
+      <default>0</default>
+      <min>0</min>
+      <max>1</max>
+    </entry>
+    <entry name="surfaceStyle" type="Int">
+      <default>0</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+    <entry name="bevelDepth" type="Int">
+      <default>2</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+    <entry name="motionEnabled" type="Bool">
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

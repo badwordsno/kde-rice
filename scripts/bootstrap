@@ -77,6 +77,10 @@ for command_name in realpath date sed awk sha256sum tar readlink cp mv mkdir ln;
 done
 refuse_root
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
     || -v KDE_RICE_STEP_RUNNER || -v KDE_RICE_DBUS_TOOL ]]; then
     [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
@@ -226,6 +230,11 @@ case "$signature" in
         panel_class=managed-target
         panel_target=$signature
         run_v03=false
+        ;;
+    minimalist-v04-workspaces-duplicate-tail)
+        printf '\nREFUSED: the exact stale duplicate-tail recovery must be completed first.\n' >&2
+        printf 'Use scripts/recover-chimera-duplicate-tail with the reviewed receipt; bootstrap wrote nothing.\n' >&2
+        exit 1
         ;;
     *)
         printf '\nREFUSED: panel signature is unknown; no snapshot or setting was written.\n' >&2
@@ -456,7 +465,7 @@ run_component "$FASTFETCH_COMPONENT" --home "$TARGET_HOME" --apply \
     || transaction_failure $? "Fastfetch configuration step failed"
 current_step=black-minimal
 run_component "$SCRIPT_DIR/apply-black" --home "$TARGET_HOME" --apply \
-    || transaction_failure $? "Black Minimal step failed"
+    || transaction_failure $? "Minimalist Black step failed"
 current_step=breeze-shell
 run_component "$SCRIPT_DIR/apply-modern" --home "$TARGET_HOME" --apply \
     || transaction_failure $? "Breeze shell step failed"

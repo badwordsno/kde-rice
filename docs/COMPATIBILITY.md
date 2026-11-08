@@ -3,14 +3,8 @@
 Compatibility is determined from observable KDE APIs and capabilities, not a
 distribution name. Fedora and EndeavourOS are the recorded native validation
 lanes; plain Arch and Debian-family package mappings are best-effort until the
-same release candidate completes a native acceptance run. Every Extended host
+same release candidate completes a native acceptance run. Every target host
 must pass doctor regardless of its distribution.
-
-The KDE Store edition has a separate, narrower contract. Its metadata accepts
-Plasma 6.0 or newer, it embeds its own color scheme, and it selects only Breeze
-appearance components. A tagged Version 1.0 release and KDE Store publication
-still require the Fedora and Arch-family apply/reapply/revert/remove acceptance
-in `docs/RELEASE.md`.
 
 ## Canonical diagnosis
 
@@ -18,7 +12,7 @@ in `docs/RELEASE.md`.
 scripts/doctor --target minimalist-v04
 ```
 
-The Extended v0.4.1 panel target checks Plasma/KWin, Wayland, D-Bus scripting, apply tools,
+The v0.4.1 panel target checks Plasma/KWin, Wayland, D-Bus scripting, apply tools,
 Breeze, fonts, Fastfetch 2.40+, applets including
 `org.kde.plasma.icontasks`, panel topology, KSystemStats CPU/memory support,
 the LibKSysGuard sensor QML module, KDE's event-driven PulseAudioQt volume QML
@@ -68,10 +62,11 @@ Bootstrap accepts:
 
 The final result is always Minimalist v0.4.1. Bootstrap does not add an
 optional switcher to the base target, but an already exact Pager or Workspaces
-variant is preserved, reasserted, and verified with its own target signature.
-Historical Silver Palace and Retro Workstation layouts are not accepted
-targets. Unknown or unexplained panels and widgets are refused rather than
-normalized.
+variant is preserved, reasserted, recorded in the transaction receipt, and
+verified with its own target signature. It does not convert one optional
+variant into the other. Historical Silver Palace and Retro Workstation layouts
+are not accepted targets. Unknown or unexplained panels and widgets are refused
+rather than normalized.
 
 The guarded v0.4.1 transition accepts the exact v0.3 sequence, adds the second
 expanding spacer, waits for its live geometry to settle, and adds the native

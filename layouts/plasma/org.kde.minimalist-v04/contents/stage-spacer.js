@@ -2,29 +2,53 @@
 // manager is deliberately created by a later Plasma script invocation, after
 // this new spacer has a stable live geometry.
 
+// BEGIN GENERATED PANEL CONSTANTS
 const spacerType = "org.kde.plasma.panelspacer";
 const resourceType = "org.kde.minimalist.resources";
 const v03Widgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const v03WidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "resources": 3,
+    "margin": 4,
+    "input": 5,
+    "tray": 6,
+    "clock": 7
+};
 const stagedWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const stagedWidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "rightSpacer": 3,
+    "resources": 4,
+    "margin": 5,
+    "input": 6,
+    "tray": 7,
+    "clock": 8
+};
+// END GENERATED PANEL CONSTANTS
+
 
 function sameSequence(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
@@ -98,11 +122,13 @@ if (knownWidgetTypes.indexOf(spacerType) === -1) {
 
 const before = orderedPanelState(panel);
 let transition = "already-staged";
+let leftSpacer = null;
 let rightSpacer = null;
 let addedSpacer = false;
 if (sameSequence(before.types, v03Widgets)) {
     transition = "stage-v0.4.1-spacer";
-    const resource = before.widgets[3];
+    leftSpacer = before.widgets[v03WidgetsPositions.leftSpacer];
+    const resource = before.widgets[v03WidgetsPositions.resources];
     if (!validAnchor(resource)) {
         throw new Error("could not resolve the resource placement anchor");
     }
@@ -118,14 +144,15 @@ if (sameSequence(before.types, v03Widgets)) {
     }
     addedSpacer = true;
 } else if (sameSequence(before.types, stagedWidgets)) {
-    rightSpacer = before.widgets[3];
+    leftSpacer = before.widgets[stagedWidgetsPositions.leftSpacer];
+    rightSpacer = before.widgets[stagedWidgetsPositions.rightSpacer];
 } else {
     throw new Error(
         "panel topology differs from the exact Minimalist v0.3/spacer-staged states: "
         + before.types.join(";")
     );
 }
-configureSpacer(before.widgets[2]);
+configureSpacer(leftSpacer);
 configureSpacer(rightSpacer);
 
 print(

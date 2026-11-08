@@ -2,8 +2,9 @@
 #
 # Snapshot and apply commands never read this file and never add these paths to
 # new managed state. Keeping this narrow allowlist preserves rollback for
-# snapshots created before Minimalist became the sole active direction.
+# snapshots created before these exact paths left the active managed scope.
 
+.config/kcminputrc
 .local/share/color-schemes/RetroWorkstation.colors
 .local/share/konsole/RetroWorkstation.colorscheme
 .local/share/konsole/RetroWorkstation.profile

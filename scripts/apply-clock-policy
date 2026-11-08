@@ -73,6 +73,10 @@ done
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
     || -v KDE_RICE_DBUS_TOOL ]]; then
     [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
@@ -82,22 +86,8 @@ require_current_desktop_home "$TARGET_HOME" dbus-mock
 [[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
 [[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
 
-set +e
-doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
-doctor_status=$?
-set -e
-printf '%s\n' "$doctor_output"
-case "$doctor_status" in
-    0) ;;
-    1)
-        if $APPLY && ! $ALLOW_DEGRADED; then
-            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
-        fi
-        warn "doctor reported degraded compatibility"
-        ;;
-    2) die "doctor reported unsupported; clock-policy apply is refused" ;;
-    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
-esac
+require_component_diagnosis "$DOCTOR_COMMAND" minimalist-v04 "$APPLY" "$ALLOW_DEGRADED" \
+    "clock-policy apply is refused"
 
 DBUS_TOOL=$(resolve_dbus_tool) \
     || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"

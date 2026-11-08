@@ -95,6 +95,10 @@ require_command mv
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_DBUS_TOOL ]]; then
     [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
         || die "internal fresh-install overrides are available only in isolated test mode"

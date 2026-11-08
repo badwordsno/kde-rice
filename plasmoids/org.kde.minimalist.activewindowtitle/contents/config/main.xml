@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="titleTemplate" type="String">
+      <default>{title}</default>
+    </entry>
+    <entry name="showIcon" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="widthMode" type="Int">
+      <default>1</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+    <entry name="minimumWidthUnits" type="Int">
+      <default>8</default>
+      <min>4</min>
+      <max>40</max>
+    </entry>
+    <entry name="preferredWidthUnits" type="Int">
+      <default>18</default>
+      <min>4</min>
+      <max>60</max>
+    </entry>
+    <entry name="maximumWidthUnits" type="Int">
+      <default>20</default>
+      <min>4</min>
+      <max>80</max>
+    </entry>
+    <entry name="maximizedOnly" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="wheelSwitch" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="doubleClickMaximize" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="middleClickClose" type="Bool">
+      <default>false</default>
+    </entry>
+    <entry name="density" type="Int">
+      <default>0</default>
+      <min>0</min>
+      <max>1</max>
+    </entry>
+    <entry name="surfaceStyle" type="Int">
+      <default>0</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+    <entry name="bevelDepth" type="Int">
+      <default>2</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+    <entry name="motionEnabled" type="Bool">
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

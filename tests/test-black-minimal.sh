@@ -28,16 +28,25 @@ KONSOLE_PROFILE="$REPO_ROOT/config/konsole/BlackMinimal.profile"
 TARGET_HOME="$TEMP_ROOT/home"
 
 grep -Fq 'ColorScheme=BlackMinimal' "$SCHEME" || fail "KDE scheme identity is wrong"
-grep -Fq 'Name=Black Minimal' "$SCHEME" || fail "KDE scheme name is wrong"
+grep -Fq 'Name=Minimalist Black' "$SCHEME" || fail "KDE scheme name is wrong"
+grep -Fq 'Name[ko]=미니멀리스트 블랙' "$SCHEME" \
+    || fail "KDE scheme Korean name is wrong"
 [[ $(grep -Fc 'BackgroundNormal=0,0,0' "$SCHEME") -ge 4 ]] || fail "major KDE surfaces are not true black"
-grep -Fq 'DecorationFocus=145,70,255' "$SCHEME" || fail "vivid-purple focus color is missing"
-grep -Fq 'BackgroundNormal=145,70,255' "$SCHEME" || fail "vivid-purple selection background is missing"
+grep -Fq 'DecorationFocus=0,122,204' "$SCHEME" || fail "blue focus color is missing"
+grep -Fq 'BackgroundNormal=0,122,204' "$SCHEME" || fail "blue selection background is missing"
 grep -Fq 'BackgroundNormal=12,12,15' "$SCHEME" || fail "secondary surface tone is missing"
 grep -Fq 'Color=0,0,0' "$KONSOLE_SCHEME" || fail "Konsole background is not true black"
 grep -Fq 'Opacity=1' "$KONSOLE_SCHEME" || fail "Konsole is not opaque"
 grep -Fq 'Blur=false' "$KONSOLE_SCHEME" || fail "Konsole blur is enabled"
+grep -Fq 'Description=Minimalist Black' "$KONSOLE_SCHEME" \
+    || fail "Konsole scheme description is wrong"
+grep -Fq 'Description[ko]=미니멀리스트 블랙' "$KONSOLE_SCHEME" \
+    || fail "Konsole scheme Korean description is wrong"
 grep -Fq 'ColorScheme=BlackMinimal' "$KONSOLE_PROFILE" || fail "Konsole profile uses the wrong scheme"
 grep -Fq 'Font=Hack,11' "$KONSOLE_PROFILE" || fail "Konsole font baseline changed"
+grep -Fq 'Name=Minimalist Black' "$KONSOLE_PROFILE" || fail "Konsole profile name is wrong"
+grep -Fq 'Name[ko]=미니멀리스트 블랙' "$KONSOLE_PROFILE" \
+    || fail "Konsole profile Korean name is wrong"
 
 for target in \
     .local/share/color-schemes/BlackMinimal.colors \
@@ -47,17 +56,17 @@ for target in \
 done
 
 if grep -Eq 'plasma-apply-wallpaperimage|applywindowdecoration|evaluateScript|kwinoutputconfig|\.local/share/kscreen' "$REPO_ROOT/scripts/apply-black"; then
-    fail "Black Minimal apply path may change wallpaper, shell geometry, decoration, or display settings"
+    fail "Minimalist Black apply path may change wallpaper, shell geometry, decoration, or display settings"
 fi
 
 grep -Fq 'plasma-apply-colorscheme BlackMinimal' "$REPO_ROOT/scripts/apply-black" || fail "KDE scheme activation is missing"
-grep -Fq "plasma-apply-colorscheme --accent-color '#9146FF'" "$REPO_ROOT/scripts/apply-black" || fail "accent activation is missing"
-if grep -Fq "plasma-apply-colorscheme --accent-color '#9146FF' BlackMinimal" "$REPO_ROOT/scripts/apply-black"; then
+grep -Fq "plasma-apply-colorscheme --accent-color '#007ACC'" "$REPO_ROOT/scripts/apply-black" || fail "accent activation is missing"
+if grep -Fq "plasma-apply-colorscheme --accent-color '#007ACC' BlackMinimal" "$REPO_ROOT/scripts/apply-black"; then
     fail "scheme and accent are combined in a Plasma 6.7-incompatible call"
 fi
-grep -Fq -- '--group "Colors:Selection" --key BackgroundNormal "145,70,255"' "$REPO_ROOT/scripts/apply-black" || fail "exact selection color activation is missing"
+grep -Fq -- '--group "Colors:Selection" --key BackgroundNormal "0,122,204"' "$REPO_ROOT/scripts/apply-black" || fail "exact selection color activation is missing"
 grep -Fq '[[ $active_scheme == BlackMinimal ]]' "$REPO_ROOT/scripts/apply-black" || fail "post-apply scheme verification is missing"
-grep -Fq '[[ $active_selection == 145,70,255 ]]' "$REPO_ROOT/scripts/apply-black" || fail "post-apply selection verification is missing"
+grep -Fq '[[ $active_selection == 0,122,204 ]]' "$REPO_ROOT/scripts/apply-black" || fail "post-apply selection verification is missing"
 
 mkdir -p -- "$TARGET_HOME/.config"
 printf 'baseline-kdeglobals\n' > "$TARGET_HOME/.config/kdeglobals"
@@ -106,4 +115,40 @@ bash "$REPO_ROOT/scripts/restore" --backup "$snapshot_path" --home "$TARGET_HOME
 [[ $(sha256sum "$TARGET_HOME/.config/plasmashellrc") == "$shell_before" ]] || fail "restore changed panel baseline"
 [[ $(sha256sum "$TARGET_HOME/.config/kwinoutputconfig.json") == "$display_before" ]] || fail "restore changed display baseline"
 
-printf 'PASS: Black Minimal visual layer tests\n'
+mkdir -p -- "$TARGET_HOME/.local/share/konsole"
+printf 'personal Konsole colors\n' > "$TARGET_HOME/.local/share/konsole/BlackMinimal.colorscheme"
+printf 'personal Konsole profile\n' > "$TARGET_HOME/.local/share/konsole/BlackMinimal.profile"
+konsole_asset_before=$(sha256sum "$TARGET_HOME/.local/share/konsole/BlackMinimal.colorscheme")
+profile_asset_before=$(sha256sum "$TARGET_HOME/.local/share/konsole/BlackMinimal.profile")
+
+bash "$REPO_ROOT/scripts/apply-black" --home "$TARGET_HOME" --colors-only --install-only --dry-run \
+    > "$TEMP_ROOT/colors-dry-run.txt"
+if grep -Fq 'config/konsole/' "$TEMP_ROOT/colors-dry-run.txt"; then
+    fail "colors-only preview schedules Konsole asset installation"
+fi
+[[ ! -e $TARGET_HOME/.local/share/color-schemes/BlackMinimal.colors ]] \
+    || fail "colors-only preview installed the palette"
+bash "$REPO_ROOT/scripts/apply-black" --home "$TARGET_HOME" --colors-only --install-only --apply \
+    > "$TEMP_ROOT/colors-apply.txt"
+colors_snapshot=$(sed -n 's/^Pre-apply snapshot: //p' "$TEMP_ROOT/colors-apply.txt")
+[[ -f $colors_snapshot/complete ]] || fail "colors-only snapshot is incomplete"
+cmp -s "$REPO_ROOT/config/managed-paths.txt" "$colors_snapshot/managed-paths.txt" \
+    || fail "colors-only narrowed the snapshot boundary"
+cmp -s "$SCHEME" "$TARGET_HOME/.local/share/color-schemes/BlackMinimal.colors" \
+    || fail "colors-only installed the wrong palette"
+[[ $(sha256sum "$TARGET_HOME/.local/share/konsole/BlackMinimal.colorscheme") == "$konsole_asset_before" ]] \
+    || fail "colors-only overwrote personal Konsole colors"
+[[ $(sha256sum "$TARGET_HOME/.local/share/konsole/BlackMinimal.profile") == "$profile_asset_before" ]] \
+    || fail "colors-only overwrote the Konsole profile"
+[[ $(sha256sum "$TARGET_HOME/.config/konsolerc") == "$konsole_before" ]] \
+    || fail "colors-only changed Konsole configuration"
+[[ $(sha256sum "$TARGET_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc") == "$wallpaper_before" ]] \
+    || fail "colors-only changed panel or wallpaper configuration"
+bash "$REPO_ROOT/scripts/restore" --backup "$colors_snapshot" --home "$TARGET_HOME" \
+    --state-root "$TARGET_HOME/.local/state/kde-rice/test-restore-colors" --apply > "$TEMP_ROOT/colors-restore.txt"
+[[ ! -e $TARGET_HOME/.local/share/color-schemes/BlackMinimal.colors ]] \
+    || fail "colors-only rollback left a newly installed palette"
+[[ $(sha256sum "$TARGET_HOME/.local/share/konsole/BlackMinimal.profile") == "$profile_asset_before" ]] \
+    || fail "colors-only rollback changed the Konsole baseline"
+
+printf 'PASS: Minimalist Black visual layer tests\n'

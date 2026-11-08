@@ -64,6 +64,11 @@ const minimalistV04PagerTargetWidgets = minimalistV04TargetWidgets.slice();
 minimalistV04PagerTargetWidgets.splice(1, 0, "org.kde.plasma.pager");
 const minimalistV04WorkspacesTargetWidgets = minimalistV04TargetWidgets.slice();
 minimalistV04WorkspacesTargetWidgets.splice(1, 0, "org.kde.minimalist.workspaces");
+const minimalistV04WorkspacesDuplicateTailWidgets =
+    minimalistV04WorkspacesTargetWidgets.concat([
+        "org.kde.minimalist.activewindowtitle",
+        "org.kde.minimalist.resources"
+    ]);
 const missingConfigValue = "__KDE_RICE_MISSING__";
 const requiredTrayWidgets = [
     "org.kde.plasma.networkmanagement",
@@ -549,6 +554,21 @@ if (panelIds.length === 1 && panelObjects.length === 1) {
         && onlyPanel.screen === 0
         && onlyPanel.formFactor === "horizontal"
         && onlyPanel.location === "top"
+        && sameSequence(types, minimalistV04WorkspacesDuplicateTailWidgets)) {
+        signature = "minimalist-v04-workspaces-duplicate-tail";
+        transition = "recover-v04-workspaces-duplicate-tail";
+        reusePanelId = readable(onlyPanel.id);
+        target = targetPolicy(onlyPanel, {
+            ordered_types: onlyState.ordered_types.slice(
+                0, minimalistV04WorkspacesTargetWidgets.length),
+            widgets: onlyState.ordered_widgets.slice(
+                0, minimalistV04WorkspacesTargetWidgets.length)
+        });
+        target.complete = false;
+    } else if (onlyState.order_valid
+        && onlyPanel.screen === 0
+        && onlyPanel.formFactor === "horizontal"
+        && onlyPanel.location === "top"
         && sameSequence(types, minimalistV04WorkspacesTargetWidgets)) {
         signature = "minimalist-v04-workspaces";
         transition = "v04-workspaces-target";
@@ -690,10 +710,12 @@ if (signature === "minimalist-v03") {
     observedTargetWidgets = minimalistV04TaskFrontStagedWidgets;
 } else if (signature === "minimalist-v04") {
     observedTargetWidgets = minimalistV04TargetWidgets;
-    } else if (signature === "minimalist-v04-pager") {
-        observedTargetWidgets = minimalistV04PagerTargetWidgets;
-    } else if (signature === "minimalist-v04-workspaces") {
-        observedTargetWidgets = minimalistV04WorkspacesTargetWidgets;
+} else if (signature === "minimalist-v04-pager") {
+    observedTargetWidgets = minimalistV04PagerTargetWidgets;
+} else if (signature === "minimalist-v04-workspaces") {
+    observedTargetWidgets = minimalistV04WorkspacesTargetWidgets;
+} else if (signature === "minimalist-v04-workspaces-duplicate-tail") {
+    observedTargetWidgets = minimalistV04WorkspacesDuplicateTailWidgets;
 }
 if (panels.length === 1) {
     const markerPanel = panels[0];
@@ -718,6 +740,9 @@ if (panels.length === 1) {
             && Number(markerPanel.widget_counts[expectedType] || 0) !== expectedCounts[expectedType]) {
             noDuplicateTargetWidgets = false;
         }
+    }
+    if (signature === "minimalist-v04-workspaces-duplicate-tail") {
+        noDuplicateTargetWidgets = false;
     }
 }
 

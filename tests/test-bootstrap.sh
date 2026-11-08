@@ -205,7 +205,7 @@ fi
 retired_wallpaper_pattern='Minimalist''V02|apply-personal-''wallpaper|wallpaper-''variant|plasma-apply-''wallpaperimage'
 if grep -Eq "$retired_wallpaper_pattern" \
     "$REPO_ROOT/scripts/bootstrap" "$REPO_ROOT/scripts/doctor" "$REPO_ROOT/scripts/verify"; then
-    fail "active Extended entry points retain a private wallpaper dependency"
+    fail "active desktop entry points retain a private wallpaper dependency"
 fi
 
 set +e

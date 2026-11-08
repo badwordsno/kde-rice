@@ -17,6 +17,7 @@ LAYOUT_TARGET_RELATIVE=".local/share/plasma/layout-templates/org.kde.minimalist-
 WORKSPACE_SOURCE_RELATIVE="plasmoids/org.kde.minimalist.workspaces"
 WORKSPACE_TARGET_RELATIVE=".local/share/plasma/plasmoids/org.kde.minimalist.workspaces"
 PANEL_CONFIG_RELATIVE=".config/plasma-org.kde.plasma.desktop-appletsrc"
+KWIN_CONFIG_RELATIVE=".config/kwinrc"
 
 usage() {
     cat <<'EOF'
@@ -24,7 +25,8 @@ Usage: scripts/apply-workspaces-preview [OPTIONS]
 
 Preview or apply the compact Minimalist Workspaces switcher. The guarded
 apply replaces the one built-in Pager after the launcher with one project
-Plasmoid. The four-desktop, one-row KWin topology is preserved unchanged.
+Plasmoid. An exact one-desktop Workspaces target is repaired by adding only
+desktops 2-4; an existing four-desktop, one-row topology is preserved.
 
 Options:
   --home ABSOLUTE_PATH  Target home directory (default: $HOME)
@@ -34,7 +36,8 @@ Options:
   -h, --help            Show this help
 
 Only the exact 32px Minimalist v0.4.1 Pager source or a known Workspaces
-revision is accepted. Plasma and KWin are never restarted.
+revision with one or four desktops is accepted. Plasma and KWin are never
+restarted.
 EOF
 }
 
@@ -65,12 +68,16 @@ while (($#)); do
     esac
 done
 
-for command_name in realpath cp date mv mkdir diff sleep jq rg; do
+for command_name in realpath cp date mv mkdir diff sleep jq rg sha256sum sync; do
     require_command "$command_name"
 done
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
     || -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_KWIN_BUSCTL \
     || -v KDE_RICE_QML_IMPORT_ROOT ]]; then
@@ -81,22 +88,8 @@ require_current_desktop_home "$TARGET_HOME" dbus-mock
 [[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
 [[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
 
-set +e
-doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
-doctor_status=$?
-set -e
-printf '%s\n' "$doctor_output"
-case "$doctor_status" in
-    0) ;;
-    1)
-        if $APPLY && ! $ALLOW_DEGRADED; then
-            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
-        fi
-        warn "doctor reported degraded compatibility"
-        ;;
-    2) die "doctor reported unsupported; Workspaces preview is refused" ;;
-    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
-esac
+require_component_diagnosis "$DOCTOR_COMMAND" minimalist-v04 "$APPLY" "$ALLOW_DEGRADED" \
+    "Workspaces preview is refused"
 
 DBUS_TOOL=$(resolve_dbus_tool) \
     || die "required Plasma 6 D-Bus client not found (tried qdbus6, qdbus-qt6, qdbus)"
@@ -141,7 +134,8 @@ declare -A managed=()
 for relative in "${MANAGED_PATHS[@]}"; do
     managed[$relative]=1
 done
-for target_relative in "$LAYOUT_TARGET_RELATIVE" "$WORKSPACE_TARGET_RELATIVE" "$PANEL_CONFIG_RELATIVE"; do
+for target_relative in "$LAYOUT_TARGET_RELATIVE" "$WORKSPACE_TARGET_RELATIVE" \
+    "$PANEL_CONFIG_RELATIVE" "$KWIN_CONFIG_RELATIVE"; do
     validate_relative_path "$target_relative" || die "unsafe Workspaces-preview target: $target_relative"
     [[ -n ${managed[$target_relative]+x} ]] \
         || die "Workspaces-preview target is not managed: $target_relative"
@@ -180,11 +174,34 @@ json_scalar_number() {
     jq -er '.data | if type == "array" then .[0] else . end | select(type == "number")'
 }
 
+json_scalar_string() {
+    jq -er '.data | if type == "array" then .[0] else . end | select(type == "string" and length > 0)'
+}
+
 read_kwin_state() {
     KWIN_COUNT=$(kwin_property_json count | json_scalar_number) \
         || die "KWin virtual-desktop count reply is unavailable or malformed"
     KWIN_ROWS=$(kwin_property_json rows | json_scalar_number) \
         || die "KWin virtual-desktop row reply is unavailable or malformed"
+    KWIN_DESKTOPS_JSON=$(kwin_property_json desktops) \
+        || die "KWin virtual-desktop inventory is unavailable"
+    printf '%s\n' "$KWIN_DESKTOPS_JSON" | jq -e \
+        --argjson count "$KWIN_COUNT" '
+            .data | type == "array" and length == $count
+            and all(.[]; length == 3 and (.[0] | type == "number")
+                and (.[1] | type == "string" and length > 0)
+                and (.[2] | type == "string"))
+            and ([.[][1]] | unique | length) == $count
+        ' >/dev/null \
+        || die "KWin virtual-desktop inventory does not match its count"
+    KWIN_INVENTORY=$(printf '%s\n' "$KWIN_DESKTOPS_JSON" | jq -ec \
+        '[.data[] | {position: .[0], id: .[1], name: .[2]}]') \
+        || die "KWin virtual-desktop inventory could not be normalized"
+    KWIN_CURRENT=$(kwin_property_json current | json_scalar_string) \
+        || die "KWin current-desktop reply is unavailable or malformed"
+    printf '%s\n' "$KWIN_INVENTORY" | jq -e --arg id "$KWIN_CURRENT" \
+        'map(.id) | index($id) != null' >/dev/null \
+        || die "KWin current desktop is absent from its inventory"
 }
 
 marker_field() {
@@ -235,8 +252,46 @@ else
     esac
 fi
 read_kwin_state
-[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
-    || die "Workspaces preview requires exactly four KWin desktops in one row"
+if [[ $initial_topology == minimalist-v04-pager ]]; then
+    [[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+        || die "Pager source requires exactly four KWin desktops in one row"
+elif [[ $KWIN_ROWS != 1 || ( $KWIN_COUNT != 1 && $KWIN_COUNT != 4 ) ]]; then
+    die "Workspaces target requires exactly one or four KWin desktops in one row"
+fi
+repair_only=false
+if [[ $initial_topology == minimalist-v04-workspaces \
+    && $initial_workspace_revision == 2 && $KWIN_COUNT == 1 ]]; then
+    repair_only=true
+fi
+initial_kwin_count=$KWIN_COUNT
+initial_kwin_rows=$KWIN_ROWS
+initial_kwin_inventory=$KWIN_INVENTORY
+initial_kwin_current=$KWIN_CURRENT
+initial_panel_marker=$preflight
+initial_panel_config_digest=
+if $repair_only; then
+    [[ $(path_type "$TARGET_HOME/$PANEL_CONFIG_RELATIVE") == file ]] \
+        || die "repair-only Workspaces target requires a regular Plasma panel config"
+    read -r initial_panel_config_digest _ \
+        < <(sha256sum -- "$TARGET_HOME/$PANEL_CONFIG_RELATIVE")
+fi
+if [[ $KWIN_COUNT == 1 ]]; then
+    virtual_desktop_api=$($KWIN_BUSCTL --user introspect org.kde.KWin \
+        /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager 2>/dev/null) \
+        || die "KWin virtual-desktop mutation API could not be introspected"
+    printf '%s\n' "$virtual_desktop_api" \
+        | rg -q 'createDesktop[[:space:]]+method[[:space:]]+us[[:space:]]+-' \
+        || die "KWin createDesktop(uint,string) API is unavailable"
+    printf '%s\n' "$virtual_desktop_api" \
+        | rg -q 'setDesktopName[[:space:]]+method[[:space:]]+ss[[:space:]]+-' \
+        || die "KWin setDesktopName(string,string) API is unavailable"
+    printf '%s\n' "$virtual_desktop_api" \
+        | rg -q 'removeDesktop[[:space:]]+method[[:space:]]+s[[:space:]]+-' \
+        || die "KWin removeDesktop(string) API is unavailable"
+    printf '%s\n' "$virtual_desktop_api" \
+        | rg -q 'current[[:space:]]+property[[:space:]]+s.*writable' \
+        || die "KWin writable current-desktop property is unavailable for guarded rollback"
+fi
 printf 'KWin virtual desktops: count=%s rows=%s\n' "$KWIN_COUNT" "$KWIN_ROWS"
 printf 'Confirmed APIs: VirtualDesktopInfo state; Plasma SessionBus; KWin nextDesktop()/previousDesktop()\n'
 
@@ -244,18 +299,26 @@ timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 apply_id="$timestamp-workspaces-preview-$$"
 snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
 displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+repair_receipt="$TARGET_HOME/.local/state/kde-rice/workspaces-repair/$apply_id"
 printf -v restore_preview '%q --backup %q --home %q' \
     "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
 printf -v restore_apply '%s --apply' "$restore_preview"
 assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/snapshots/$apply_id"
 assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/$apply_id"
+assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/workspaces-repair/$apply_id"
 
 printf '\n2. Complete change plan\n'
 printf '  current accepted topology: %s on one screen-0 top panel at 32 logical px\n' "$initial_topology"
-printf '  current KWin topology: four virtual desktops in one horizontal row\n'
-printf '  managed asset write: %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
-printf '  managed asset refresh: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
-printf '  managed config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+printf '  current KWin topology: %s virtual desktop(s) in one horizontal row\n' "$KWIN_COUNT"
+if $repair_only; then
+    printf '  managed asset writes: none; the installed Workspaces package and layout remain byte-for-byte untouched\n'
+    printf '  managed config that may change: %s\n' "$KWIN_CONFIG_RELATIVE"
+    printf '  read-only integrity guard: %s and the exact live panel marker\n' "$PANEL_CONFIG_RELATIVE"
+else
+    printf '  managed asset write: %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
+    printf '  managed asset refresh: %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
+    printf '  managed config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
+fi
 if [[ $initial_topology == minimalist-v04-pager ]]; then
     printf '  panel removal: exactly one built-in org.kde.plasma.pager after the launcher\n'
     printf '  panel addition: exactly one org.kde.minimalist.workspaces at the same launcher anchor\n'
@@ -265,13 +328,26 @@ elif [[ $initial_workspace_revision == 1 ]]; then
 else
     printf '  panel removals/additions: none (the exact Workspaces target already exists)\n'
 fi
-printf '  Workspaces policy write: General/packageRevision=2\n'
+if $repair_only; then
+    printf '  Workspaces policy writes: none; widget ID, configuration, and panel order are preserved\n'
+else
+    printf '  Workspaces policy write: General/packageRevision=2\n'
+fi
 printf '  click behavior: reach buttons 1-4 through the confirmed no-argument KWin next/previous desktop APIs\n'
-printf '  KWin changes: none; desktop count, row layout, IDs, names, and current desktop are preserved\n'
+if [[ $KWIN_COUNT == 1 ]]; then
+    printf '  virtual desktop additions: exactly three (positions 2-4; labels 2, 3, 4)\n'
+    printf '  KWin preservation: retain desktop 1 identity/name and current desktop; keep one row\n'
+else
+    printf '  virtual desktop additions: none; count, row layout, IDs, names, and current desktop are preserved\n'
+fi
 printf '  existing widget moves/resizes: none; panel remains 32 logical px\n'
 printf '  preserve: task launchers, wallpaper, shortcuts, clock, resource widget, tray, and display modes\n'
 printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
 printf '  snapshot destination: %s\n' "$snapshot_path"
+if [[ $KWIN_COUNT == 1 ]]; then
+    printf '  automatic KWin rollback: remove only the three transaction-created desktop IDs in reverse order\n'
+    printf '  durable repair receipt: %s\n' "$repair_receipt"
+fi
 if [[ $initial_topology == minimalist-v04-pager ]]; then
     printf '  automatic failure rollback: restore the stock numbered Pager live, then restore the complete snapshot\n'
 elif [[ $initial_workspace_revision == 1 ]]; then
@@ -290,13 +366,28 @@ fi
 printf '\n3. Capturing the complete managed scope before the first write\n'
 capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot" snapshot_path
 
+created_desktop_ids=()
 workspace_write_attempted=false
+if $repair_only; then
+    umask 077
+    mkdir -p -- "$repair_receipt"
+    printf '%s\n' "$snapshot_path" > "$repair_receipt/snapshot-path"
+    printf '%s\n' "$initial_kwin_inventory" > "$repair_receipt/kwin-before.json"
+    printf '%s\n' "$initial_kwin_current" > "$repair_receipt/current-before"
+    printf '%s\n' "$initial_panel_marker" > "$repair_receipt/panel-before"
+    printf '%s\n' "$initial_panel_config_digest" > "$repair_receipt/panel-config-sha256.before"
+    : > "$repair_receipt/created-desktop-ids.tsv"
+    sync -f "$repair_receipt/created-desktop-ids.tsv"
+fi
 apply_error() {
     local status=$?
     local cleanup_result=
     local cleanup_source="$layout_source/contents/workspaces-cleanup.js"
     local refresh_restore_result=
     local refresh_restore_source="$layout_source/contents/workspaces-refresh-restore.js"
+    local index
+    local desktop_id
+    local current_is_created=false
     local restore_status=0
     trap - EXIT
     set +e
@@ -313,6 +404,39 @@ apply_error() {
             warn "live replacement cleanup could not prove a safe exact target; no unrelated widget was removed"
         fi
     fi
+    if ((${#created_desktop_ids[@]} > 0)); then
+        read_kwin_state
+        for desktop_id in "${created_desktop_ids[@]}"; do
+            if [[ $KWIN_CURRENT == "$desktop_id" ]]; then
+                current_is_created=true
+                break
+            fi
+        done
+        if $current_is_created; then
+            if "$KWIN_BUSCTL" --user set-property org.kde.KWin /VirtualDesktopManager \
+                org.kde.KWin.VirtualDesktopManager current s "$initial_kwin_current" \
+                >/dev/null 2>&1; then
+                read_kwin_state
+                [[ $KWIN_CURRENT == "$initial_kwin_current" ]] \
+                    || warn "could not prove restoration of the original current desktop"
+            else
+                warn "could not restore the original current desktop before cleanup"
+            fi
+        fi
+    fi
+    for ((index = ${#created_desktop_ids[@]} - 1; index >= 0; --index)); do
+        desktop_id=${created_desktop_ids[$index]}
+        if [[ $KWIN_CURRENT == "$desktop_id" ]]; then
+            warn "leaving one transaction desktop because it is still current; receipt: $repair_receipt"
+            continue
+        fi
+        if kwin_property_json desktops | jq -e --arg id "$desktop_id" \
+            '.data | map(.[1]) | index($id) != null' >/dev/null 2>&1; then
+            "$KWIN_BUSCTL" --user call org.kde.KWin /VirtualDesktopManager \
+                org.kde.KWin.VirtualDesktopManager removeDesktop s "$desktop_id" >/dev/null 2>&1 \
+                || warn "could not remove one transaction-created virtual desktop"
+        fi
+    done
     "$SCRIPT_DIR/restore" --backup "$snapshot_path" --home "$TARGET_HOME" --apply >&2
     restore_status=$?
     if ((restore_status == 0)); then
@@ -329,6 +453,10 @@ apply_error() {
         fi
     else
         warn "automatic snapshot restore failed; use: $restore_apply"
+    fi
+    if $repair_only && [[ -d $repair_receipt ]]; then
+        printf '%s\n' failed > "$repair_receipt/failed"
+        sync -f "$repair_receipt/failed"
     fi
     exit "$status"
 }
@@ -356,34 +484,121 @@ install_managed_directory() {
         || die "installed managed directory differs from source: $target_relative"
 }
 
-printf '\n4. Installing the exact Workspaces package and refreshing the v0.4.1 layout asset\n'
-umask 077
-install_managed_directory "$workspace_source" "$WORKSPACE_TARGET_RELATIVE"
-install_managed_directory "$layout_source" "$LAYOUT_TARGET_RELATIVE"
+if $repair_only; then
+    printf '\n4. Repair-only path; no Workspaces package, layout, or panel config is written\n'
+else
+    printf '\n4. Installing the exact Workspaces package and refreshing the v0.4.1 layout asset\n'
+    umask 077
+    install_managed_directory "$workspace_source" "$WORKSPACE_TARGET_RELATIVE"
+    install_managed_directory "$layout_source" "$LAYOUT_TARGET_RELATIVE"
+fi
 
 printf '\n5. Rechecking panel, package visibility, APIs, and KWin before the live write\n'
-write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-preflight.js")")
+if $repair_only; then
+    write_preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/workspaces-preflight.js")")
+else
+    write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-preflight.js")")
+fi
 printf '%s\n' "$write_preflight"
-[[ $write_preflight == *MINIMALIST_WORKSPACES_PREFLIGHT_OK* \
-    && $write_preflight == *" topology=$initial_topology "* \
-    && $write_preflight == *" workspaceRevision=$initial_workspace_revision "* \
-    && $write_preflight == *" workspaceKnown=true "* ]] \
-    || die "panel changed or the Workspaces package did not become available before the guarded write"
+if $repair_only; then
+    [[ $write_preflight == "$initial_panel_marker" ]] \
+        || die "live panel marker changed before the repair-only KWin write"
+    read -r current_panel_config_digest _ \
+        < <(sha256sum -- "$TARGET_HOME/$PANEL_CONFIG_RELATIVE")
+    [[ $current_panel_config_digest == "$initial_panel_config_digest" ]] \
+        || die "Plasma panel config changed before the repair-only KWin write"
+else
+    [[ $write_preflight == *MINIMALIST_WORKSPACES_PREFLIGHT_OK* \
+        && $write_preflight == *" topology=$initial_topology "* \
+        && $write_preflight == *" workspaceRevision=$initial_workspace_revision "* \
+        && $write_preflight == *" workspaceKnown=true "* ]] \
+        || die "panel changed or the Workspaces package did not become available before the guarded write"
+fi
 read_kwin_state
-[[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
+[[ $KWIN_COUNT == "$initial_kwin_count" \
+    && $KWIN_ROWS == "$initial_kwin_rows" \
+    && $KWIN_INVENTORY == "$initial_kwin_inventory" \
+    && $KWIN_CURRENT == "$initial_kwin_current" ]] \
     || die "KWin desktops changed before the guarded write"
 
-printf '\n6. Installing or refreshing the compact Workspaces Plasmoid\n'
-workspace_write_attempted=true
-layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-layout.js")")
-printf '%s\n' "$layout_result"
-[[ $layout_result == *MINIMALIST_WORKSPACES_LAYOUT_OK* ]] \
-    || die "Plasma did not confirm the Workspaces layout write"
+if [[ $initial_kwin_count == 1 ]]; then
+    printf '\n6. Creating exactly three KWin virtual desktops\n'
+    initial_desktop=$(printf '%s\n' "$initial_kwin_inventory" | jq -ec '.[0]') \
+        || die "initial KWin desktop could not be isolated"
+    for position in 1 2 3; do
+        temporary_name="kde-rice-$apply_id-$position"
+        before_desktop_ids=$(printf '%s\n' "$KWIN_INVENTORY" | jq -c \
+            '[.[].id]') \
+            || die "could not preserve the pre-create KWin desktop ID set"
+        printf '%s\t%s\t%s\n' "$position" "$temporary_name" "$before_desktop_ids" \
+            > "$repair_receipt/pending.tsv"
+        sync -f "$repair_receipt/pending.tsv"
+        "$KWIN_BUSCTL" --user --json=short call org.kde.KWin \
+            /VirtualDesktopManager org.kde.KWin.VirtualDesktopManager \
+            createDesktop us "$position" "$temporary_name" >/dev/null \
+            || die "KWin refused virtual desktop $((position + 1))"
+        read_kwin_state
+        matching_desktops=$(printf '%s\n' "$KWIN_INVENTORY" | jq -ec \
+            --arg name "$temporary_name" --argjson position "$position" \
+            --argjson before "$before_desktop_ids" '
+                [.[] | .id as $id
+                    | select(.position == $position and .name == $name
+                        and ($before | index($id)) == null)]
+            ') || die "could not identify the transaction-created desktop"
+        [[ $(printf '%s\n' "$matching_desktops" | jq -r 'length') == 1 ]] \
+            || die "KWin did not expose exactly one desktop with the transaction name and position"
+        desktop_id=$(printf '%s\n' "$matching_desktops" | jq -er \
+            '.[0].id | select(type == "string" and length > 0)') \
+            || die "KWin exposed a malformed transaction-created desktop ID"
+        created_desktop_ids+=("$desktop_id")
+        printf '%s\t%s\t%s\n' "$position" "$desktop_id" "$temporary_name" \
+            >> "$repair_receipt/created-desktop-ids.tsv"
+        sync -f "$repair_receipt/created-desktop-ids.tsv"
+        mv -- "$repair_receipt/pending.tsv" "$repair_receipt/resolved-$position.tsv"
+        [[ $KWIN_COUNT == $((position + 1)) && $KWIN_ROWS == 1 \
+            && $KWIN_CURRENT == "$initial_kwin_current" ]] \
+            || die "KWin desktop topology or current desktop diverged during creation"
+        current_initial_desktop=$(printf '%s\n' "$KWIN_INVENTORY" | jq -ec \
+            --arg id "$initial_kwin_current" '.[] | select(.id == $id)') \
+            || die "original KWin desktop disappeared during creation"
+        [[ $current_initial_desktop == "$initial_desktop" ]] \
+            || die "original KWin desktop identity, name, or position changed during creation"
+        "$KWIN_BUSCTL" --user call org.kde.KWin /VirtualDesktopManager \
+            org.kde.KWin.VirtualDesktopManager setDesktopName ss \
+            "$desktop_id" "$((position + 1))" >/dev/null \
+            || die "KWin refused the numeric desktop label"
+        read_kwin_state
+        current_created_desktop=$(printf '%s\n' "$KWIN_INVENTORY" | jq -ec \
+            --arg id "$desktop_id" '.[] | select(.id == $id)') \
+            || die "transaction-created KWin desktop disappeared after naming"
+        [[ $(printf '%s\n' "$current_created_desktop" | jq -r '.position') == "$position" \
+            && $(printf '%s\n' "$current_created_desktop" | jq -r '.name') == "$((position + 1))" \
+            && $KWIN_CURRENT == "$initial_kwin_current" ]] \
+            || die "transaction-created KWin desktop position, name, or current state diverged"
+    done
+else
+    printf '\n6. Exact four-desktop KWin target already present; no desktop is created\n'
+fi
 
-printf '\n7. Read-only Workspaces and KWin postcheck\n'
+if $repair_only; then
+    printf '\n7. Repair-only path; no Workspaces or panel writer is executed\n'
+else
+    printf '\n7. Installing or refreshing the compact Workspaces Plasmoid\n'
+    workspace_write_attempted=true
+    layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-layout.js")")
+    printf '%s\n' "$layout_result"
+    [[ $layout_result == *MINIMALIST_WORKSPACES_LAYOUT_OK* ]] \
+        || die "Plasma did not confirm the Workspaces layout write"
+fi
+
+printf '\n8. Read-only Workspaces and KWin postcheck\n'
 post_result=
 for attempt in {1..20}; do
-    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-postcheck.js")")
+    if $repair_only; then
+        post_result=$(evaluate_plasma_script "$(< "$layout_source/contents/workspaces-postcheck.js")")
+    else
+        post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/workspaces-postcheck.js")")
+    fi
     [[ $post_result == *MINIMALIST_WORKSPACES_POSTCHECK_OK* ]] && break
     ((attempt == 20)) || sleep 0.1
 done
@@ -393,8 +608,24 @@ printf '%s\n' "$post_result"
 read_kwin_state
 [[ $KWIN_COUNT == 4 && $KWIN_ROWS == 1 ]] \
     || die "live KWin topology changed during the panel replacement"
+if $repair_only; then
+    final_panel_marker=$(evaluate_plasma_script "$(< "$layout_source/contents/workspaces-preflight.js")")
+    [[ $final_panel_marker == "$initial_panel_marker" ]] \
+        || die "repair-only operation changed the exact live panel marker"
+    read -r final_panel_config_digest _ \
+        < <(sha256sum -- "$TARGET_HOME/$PANEL_CONFIG_RELATIVE")
+    [[ $final_panel_config_digest == "$initial_panel_config_digest" ]] \
+        || die "repair-only operation changed the Plasma panel config"
+    [[ $KWIN_CURRENT == "$initial_kwin_current" ]] \
+        || die "repair-only operation changed the current desktop"
+    final_initial_desktop=$(printf '%s\n' "$KWIN_INVENTORY" | jq -ec \
+        --arg id "$initial_kwin_current" '.[] | select(.id == $id)') \
+        || die "repair-only operation lost the original desktop"
+    [[ $final_initial_desktop == "$initial_desktop" ]] \
+        || die "repair-only operation changed the original desktop"
+fi
 
-printf '\n8. Repository read-only verification\n'
+printf '\n9. Repository read-only verification\n'
 set +e
 verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
     --panel-target minimalist-v04-workspaces --json 2>&1)
@@ -409,6 +640,14 @@ verify_non_display_failures=$(printf '%s\n' "$verify_output" | jq -er \
 if ((verify_status != 0)); then
     warn "verification retained only the pre-existing out-of-scope display fingerprint mismatch"
 fi
+if $repair_only; then
+    printf '%s\n' "$KWIN_INVENTORY" > "$repair_receipt/kwin-after.json"
+    printf '%s\n' "$KWIN_CURRENT" > "$repair_receipt/current-after"
+    printf '%s\n' "$final_panel_marker" > "$repair_receipt/panel-after"
+    printf '%s\n' "$final_panel_config_digest" > "$repair_receipt/panel-config-sha256.after"
+    printf '%s\n' complete > "$repair_receipt/complete"
+    sync -f "$repair_receipt/complete"
+fi
 
 trap - EXIT
 printf '\nMinimalist Workspaces preview apply complete.\n'
@@ -418,5 +657,13 @@ printf 'Restore apply: %s\n' "$restore_apply"
 if [[ -d $displaced_path ]]; then
     printf 'Replaced managed assets: %s\n' "$displaced_path"
 fi
+if $repair_only; then
+    printf 'Repair receipt: %s\n' "$repair_receipt"
+fi
 printf 'Result: four compact numbered desktop buttons after the launcher; active desktop uses the theme highlight.\n'
-printf 'No desktop topology, other widget, panel geometry, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'
+if [[ $initial_kwin_count == 1 ]]; then
+    printf 'KWin change: exactly three virtual desktops were added; desktop 1 and the current desktop were preserved.\n'
+else
+    printf 'KWin desktop topology was preserved unchanged.\n'
+fi
+printf 'No unrelated widget, panel geometry, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'

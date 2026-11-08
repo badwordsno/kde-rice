@@ -3,6 +3,12 @@
 
 const pagerType = "org.kde.plasma.pager";
 const workspaceType = "org.kde.minimalist.workspaces";
+const workspaceUserConfigKeys = [
+    ["labelMode", 0], ["hideWhenSingle", false], ["wrapWheel", false],
+    ["invertWheel", false], ["density", 0], ["surfaceStyle", 0],
+    ["bevelDepth", 2],
+    ["motionEnabled", true]
+];
 const baseWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
@@ -64,9 +70,27 @@ function exactGeometry(panel) {
         && panel.opacity === "opaque";
 }
 
-function configureWorkspaceSwitcher(widget) {
+function captureWorkspaceUserConfig(widget) {
+    const result = {};
     const previousGroup = widget.currentConfigGroup;
     widget.currentConfigGroup = ["General"];
+    for (let index = 0; index < workspaceUserConfigKeys.length; ++index) {
+        const entry = workspaceUserConfigKeys[index];
+        result[entry[0]] = widget.readConfig(entry[0], entry[1]);
+    }
+    widget.currentConfigGroup = previousGroup;
+    return result;
+}
+
+function configureWorkspaceSwitcher(widget, userConfig) {
+    const previousGroup = widget.currentConfigGroup;
+    widget.currentConfigGroup = ["General"];
+    if (userConfig) {
+        const keys = Object.keys(userConfig);
+        for (let index = 0; index < keys.length; ++index) {
+            widget.writeConfig(keys[index], userConfig[keys[index]]);
+        }
+    }
     widget.writeConfig("packageRevision", 2);
     widget.reloadConfig();
     widget.currentConfigGroup = previousGroup;
@@ -83,6 +107,7 @@ if (!panel || !exactGeometry(panel)
 }
 const before = orderedPanelState(panel);
 let workspaceSwitcher = null;
+let workspaceUserConfig = null;
 let transition = "already-target";
 if (sameSequence(before.types, pagerWidgets)) {
     const launcher = before.widgets[0];
@@ -115,6 +140,7 @@ if (sameSequence(before.types, pagerWidgets)) {
     const currentRevision = String(workspaceSwitcher.readConfig("packageRevision", 0));
     workspaceSwitcher.currentConfigGroup = previousGroup;
     if (currentRevision === "1") {
+        workspaceUserConfig = captureWorkspaceUserConfig(workspaceSwitcher);
         const launcher = before.widgets[0];
         const title = before.widgets[2];
         if (!launcher.geometry || !workspaceSwitcher.geometry || !title.geometry
@@ -144,7 +170,7 @@ if (sameSequence(before.types, pagerWidgets)) {
     throw new Error("panel is not an exact Pager source or Workspaces target");
 }
 
-configureWorkspaceSwitcher(workspaceSwitcher);
+configureWorkspaceSwitcher(workspaceSwitcher, workspaceUserConfig);
 print(
     "MINIMALIST_WORKSPACES_LAYOUT_OK"
     + " transition=" + transition

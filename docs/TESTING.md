@@ -22,7 +22,8 @@ Keep two gates distinct:
   dry-run, and the observed topology/capability result. Test-only `qmllint`
   absence does not weaken or override doctor.
 - **Repository release readiness:** every `tests/test-*.sh`, shell syntax,
-  `qmllint` package checks, and `git diff --check`. Missing `qmllint` leaves this
+  `qmllint` package checks, the offscreen Python readability test, and
+  `git diff --check`. Missing `qmllint` leaves this
   gate incomplete even when a live host is supported.
 
 When reporting results, say which gate was evaluated. Do not summarize a
@@ -31,11 +32,27 @@ passing repository suite.
 
 ## Complete candidate-checkout suite
 
+`scripts/check-release` runs this suite plus two release builds, checksum
+comparison, and all tests and syntax checks in the extracted public archive.
+It stops at the first failed check and prints the temporary log directory.
+The readability check runs for both the candidate and extracted source. Missing
+PySide6/Qt bindings, required QML imports, or Noto Sans are reported as `NOT RUN`;
+other checks continue, and the gate ends `INCOMPLETE` with exit code 77. That is
+not a complete release pass. Actual QML or assertion failures stop the gate. Use this
+same command as the automation entry point on a prepared non-root test host;
+it does not provision packages or perform native-session acceptance.
+
+Recovery tests additionally cover format-2 content corruption, missing checksums,
+added or missing payload entries, inherited and conflicting operation locks,
+noncanonical XDG refusal before writes, and a copy command that reports success
+with incorrect contents. Legacy format-1 recovery remains tested separately.
+
 ```bash
 set -e
 for test_script in tests/test-*.sh; do
   bash "$test_script"
 done
+python3 tests/test-panel-readability.py
 for shell_file in scripts/* scripts/lib/*.sh tests/*.sh tests/lib/*.sh; do
   [[ -f "$shell_file" ]] || continue
   bash -n "$shell_file"
@@ -43,20 +60,27 @@ done
 git diff --check
 ```
 
-The Extended archive intentionally has no `.git` directory. After extracting
-it, rerun every contained `tests/test-*.sh` and every shell syntax check from
+The public source archive intentionally has no `.git` directory. After extracting
+it, rerun every contained `tests/test-*.sh`, the readability test, and every
+shell syntax check from
 the block above, omitting only `git diff --check`. Run that Git check again
 after the extracted source is initialized as the clean-history public
 repository.
 
 The suite covers:
 
-- exact-path snapshot, restore, displaced state, legacy restore-only paths,
-  path traversal, symlink escape, and display exclusions;
+- generated panel constants matching their authored contract, read-only drift
+  detection, and refusal of unsafe or incomplete generation destinations;
+
+- restore preview classifications for content/mode changes, missing/new paths,
+  type changes, and links, without exposing contents or writing during preview;
+- exact-path snapshot, restore, displaced state, legacy restore-only paths
+  including the retired `.config/kcminputrc`, path traversal, symlink escape,
+  and display exclusions;
 - the guarded clock-only dry run/apply, exact v0.4.1 topology and 32 px geometry,
   full-scope snapshot-before-write ordering, layout-only asset refresh,
   eight-key clock-policy idempotence, enum serialization compatibility,
-  monospaced-font enforcement, and failure restore;
+  fixed `Noto Sans` panel-font enforcement, and failure restore;
 - the guarded Pager-preview dry run/apply, geometry-positioned insertion after
   the launcher, four-desktop one-row KWin state, numeric Pager policy,
   idempotence, exact-ID failure cleanup, complete snapshot restore, and
@@ -64,6 +88,11 @@ The suite covers:
 - the Workspaces revision-2 Pager replacement and revision-1 refresh,
   no-argument KWin navigation API guard, preserved widget order, and exact
   live-package failure recovery;
+- all three project Plasmoid package sources, with two widget instances on the
+  base target, the optional Workspaces instance only on its exact variant, and
+  Plasma's built-in Pager excluded from the project-package count;
+- shared component diagnosis refusal for unsupported and operational failures,
+  and explicit degraded acknowledgement before live apply;
 - doctor version, capability, topology, sensor, Fastfetch, and event-driven
   volume-backend gates;
 - bootstrap dry-run, complete v0.4.1 step order, fresh and managed transitions,
@@ -100,9 +129,7 @@ The suite covers:
   the original snapshot, and metadata-only resume for an exact final target;
 - forbidden privileged package operations and Plasma/KWin restart commands.
 - valid JSON for every public KPackage metadata and manifest;
-- the layout-free Store package contract and isolated KPackage
-  install/query/upgrade/remove lifecycle;
-- deterministic Store and Extended archives, exact allowlists, traversal and
+- the deterministic public source archive, exact allowlists, traversal and
   symlink refusal, checksums, and excluded-payload detection.
 
 ## Live read-only checks
@@ -148,11 +175,55 @@ cache, check:
 - input, tray, and clock remain usable;
 - Overview, `Meta+W`, KRunner, Kickoff, and existing global shortcuts remain
   available and unchanged;
+- keyboard focus on an optional Workspaces button has a visible theme-highlight
+  outline distinct from the current-desktop fill;
 - no new QML errors appear in the current boot journal.
 
 ## Release gate
 
-A change is ready only when the complete suite passes, both release builders
-are deterministic, `git diff --check` is clean, live verification reports no
+A change is ready only when the complete suite passes, the release build
+is deterministic, `git diff --check` is clean, live verification reports no
 unexplained managed mismatch, rollback is still printed, and the two native
 acceptance lanes in `docs/RELEASE.md` pass.
+
+## Reading verification summaries
+
+The JSON result retains its overall `status` and checks, and adds
+`summary.managed_state` (`verified` or `mismatch`) and `summary.display_state`:
+
+- `unchanged`: the checked display fingerprints agree;
+- `changed_during_apply`: the receipt's before/after fingerprints differ;
+- `changed_since_receipt`: apply recorded no display change, but current state differs;
+- `changed_since_failed_baseline`: current state differs from a failed receipt baseline.
+
+Every display mismatch still fails verification. These categories identify the
+comparison that failed, not the actor or intent behind a change. Do not
+rewrite display settings or overwrite the receipt to make verification pass.
+
+## Soft cells readability regression
+
+The public archive includes this test and its fixed baseline fixtures. With
+PySide6, Noto Sans, and the local KDE QML imports available, run:
+
+```sh
+python3 tests/test-panel-readability.py
+```
+
+The test creates a temporary HOME/XDG/runtime tree and uses offscreen Qt with
+no live session bus or sensor instances. It compares fixed pre-change QML
+excerpts with the current Workspaces frame and Resource Usage font/formatting
+code. It checks selected-text contrast, preserved selection and focus, distinct
+hover/pressed fills, metric capacity, and stable digit transitions. This is a
+fragment-level check with synthetic input, not full Plasma visual acceptance.
+Exit 77 means dependencies are unavailable and the test was not run. All other
+nonzero exits are failures. The release gate runs the default check;
+`--render` additionally regenerates the comparison and measurements under
+`research/ricing/experiments/readability-study`.
+
+For a user-reviewed three-desktop layout, read-only verification can state that
+expectation explicitly with `--panel-target minimalist-v04-workspaces
+--expected-desktops 3`. The default remains four, the actual count is never
+changed, all other checks still run, and failed-receipt resume retains its
+original four-desktop contract. Next-login staging can be previewed without
+writes using `scripts/apply-panel-font-policy --stage-next-login
+--expected-desktops 3 --dry-run`.

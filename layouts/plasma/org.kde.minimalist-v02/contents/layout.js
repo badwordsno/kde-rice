@@ -1,7 +1,7 @@
 // Minimalist v0.2: the guarded legacy status-strip transition for Plasma 6.
 //
 // This is a deliberately narrow topology change. It accepts only the approved
-// Black Minimal v0.1 strip or its own target state, removes the pager and
+// Minimalist Black v0.1 strip or its own target state, removes the pager and
 // icons-only task manager as part of this historical intermediate step, and
 // inserts a compact active-window title plus
 // Plasma's built-in flexible spacer. The launcher and status controls keep

@@ -1,54 +1,102 @@
 // Exact live rollback for v0.4.1 additions.  This script removes only the task
 // manager and right spacer introduced by the v0.3 -> v0.4.1 migration.
 
+// BEGIN GENERATED PANEL CONSTANTS
 const spacerType = "org.kde.plasma.panelspacer";
 const taskType = "org.kde.plasma.icontasks";
 const resourceType = "org.kde.minimalist.resources";
 const v03Widgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const v03WidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "resources": 3,
+    "margin": 4,
+    "input": 5,
+    "tray": 6,
+    "clock": 7
+};
 const stagedWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const stagedWidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "rightSpacer": 3,
+    "resources": 4,
+    "margin": 5,
+    "input": 6,
+    "tray": 7,
+    "clock": 8
+};
 const taskFrontWidgets = [
-    taskType,
+    "org.kde.plasma.icontasks",
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const taskFrontWidgetsPositions = {
+    "tasks": 0,
+    "launcher": 1,
+    "title": 2,
+    "leftSpacer": 3,
+    "rightSpacer": 4,
+    "resources": 5,
+    "margin": 6,
+    "input": 7,
+    "tray": 8,
+    "clock": 9
+};
 const targetWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const targetWidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "tasks": 3,
+    "rightSpacer": 4,
+    "resources": 5,
+    "margin": 6,
+    "input": 7,
+    "tray": 8,
+    "clock": 9
+};
+// END GENERATED PANEL CONSTANTS
+
 
 function sameSequence(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
@@ -96,15 +144,15 @@ if (sameSequence(before.types, v03Widgets)) {
     // Nothing from v0.4.1 remains live.
 } else if (sameSequence(before.types, stagedWidgets)) {
     transition = "remove-staged-spacer";
-    rightSpacer = before.widgets[3];
+    rightSpacer = before.widgets[stagedWidgetsPositions.rightSpacer];
 } else if (sameSequence(before.types, taskFrontWidgets)) {
     transition = "remove-task-front-stage";
-    task = before.widgets[0];
-    rightSpacer = before.widgets[4];
+    task = before.widgets[taskFrontWidgetsPositions.tasks];
+    rightSpacer = before.widgets[taskFrontWidgetsPositions.rightSpacer];
 } else if (sameSequence(before.types, targetWidgets)) {
     transition = "remove-v0.4.1-target";
-    task = before.widgets[3];
-    rightSpacer = before.widgets[4];
+    task = before.widgets[targetWidgetsPositions.tasks];
+    rightSpacer = before.widgets[targetWidgetsPositions.rightSpacer];
 } else {
     throw new Error(
         "refusing cleanup for an unknown panel topology: " + before.types.join(";")

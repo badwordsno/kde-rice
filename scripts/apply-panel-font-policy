@@ -9,7 +9,9 @@ source "$SCRIPT_DIR/lib/common.sh"
 MANIFEST="$REPO_ROOT/config/managed-paths.txt"
 TARGET_HOME=${HOME:-}
 APPLY=false
+STAGE_NEXT_LOGIN=false
 ALLOW_DEGRADED=false
+EXPECTED_DESKTOPS=4
 DOCTOR_COMMAND=${KDE_RICE_DOCTOR_COMMAND:-$SCRIPT_DIR/doctor}
 VERIFY_COMMAND=${KDE_RICE_VERIFY_COMMAND:-$SCRIPT_DIR/verify}
 LAYOUT_SOURCE_RELATIVE="layouts/plasma/org.kde.minimalist-v04"
@@ -26,16 +28,22 @@ usage() {
     cat <<'EOF'
 Usage: scripts/apply-panel-font-policy [OPTIONS]
 
-Preview or apply the Fedora 44 Noto Sans panel typography policy. On the
-exact 32px Minimalist v0.4.1 Workspaces target, the guarded apply refreshes the
-three project widgets in place and changes only the existing Digital Clock's
-font family. Panel geometry, other widgets, and KWin remain unchanged.
+Preview or apply the Fedora 44 Noto Sans panel typography and Chimera UI
+policy. On the exact 32px Minimalist v0.4.1 Workspaces target, the guarded
+apply refreshes the three project widgets when either policy revision is old
+and changes only the existing Digital Clock's font family. Panel geometry,
+other widgets, and KWin remain unchanged.
 
 Options:
   --home ABSOLUTE_PATH  Target home directory (default: $HOME)
   --apply               Snapshot and apply the panel font policy
-  --dry-run             Explicitly select preview mode (default)
+  --stage-next-login    Snapshot and install assets without touching live widgets;
+                        the new QML loads at the next normal Plasma login
+  --dry-run             Preview only (default); place after --stage-next-login
+                        to preview staging without installing assets
   --allow-degraded      Permit an explicitly reviewed degraded apply
+  --expected-desktops N Verify the explicitly accepted desktop count (default: 4);
+                        this option never changes KWin's desktop count
   -h, --help            Show this help
 
 Every topology except the exact Workspaces target is refused. Plasma and KWin
@@ -50,20 +58,31 @@ while (($#)); do
             TARGET_HOME=$2
             shift 2
             ;;
-        --apply) APPLY=true; shift ;;
+        --apply) APPLY=true; STAGE_NEXT_LOGIN=false; shift ;;
+        --stage-next-login) APPLY=true; STAGE_NEXT_LOGIN=true; shift ;;
         --dry-run) APPLY=false; shift ;;
         --allow-degraded) ALLOW_DEGRADED=true; shift ;;
+        --expected-desktops)
+            (($# >= 2)) || die "--expected-desktops requires a count"
+            [[ $2 =~ ^[1-9][0-9]*$ ]] || die "expected desktop count must be a positive integer"
+            EXPECTED_DESKTOPS=$2
+            shift 2
+            ;;
         --help | -h) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
-for command_name in realpath cp date mv mkdir diff sleep jq fc-match; do
+for command_name in realpath cp date mv mkdir diff sleep jq fc-match sha256sum sync; do
     require_command "$command_name"
 done
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 if [[ -v KDE_RICE_DOCTOR_COMMAND || -v KDE_RICE_VERIFY_COMMAND \
     || -v KDE_RICE_DBUS_TOOL || -v KDE_RICE_FONT_MATCH ]]; then
     [[ ${KDE_RICE_TEST_MODE:-0} == 1 ]] \
@@ -73,22 +92,8 @@ require_current_desktop_home "$TARGET_HOME" dbus-mock
 [[ -x $DOCTOR_COMMAND ]] || die "doctor command is unavailable: $DOCTOR_COMMAND"
 [[ -x $VERIFY_COMMAND ]] || die "verify command is unavailable: $VERIFY_COMMAND"
 
-set +e
-doctor_output=$("$DOCTOR_COMMAND" --target minimalist-v04 2>&1)
-doctor_status=$?
-set -e
-printf '%s\n' "$doctor_output"
-case "$doctor_status" in
-    0) ;;
-    1)
-        if $APPLY && ! $ALLOW_DEGRADED; then
-            die "doctor reported degraded; review it and use --allow-degraded only if its limits are acceptable"
-        fi
-        warn "doctor reported degraded compatibility"
-        ;;
-    2) die "doctor reported unsupported; panel-font apply is refused" ;;
-    *) die "doctor could not produce a trustworthy result (exit $doctor_status)" ;;
-esac
+require_component_diagnosis "$DOCTOR_COMMAND" minimalist-v04 "$APPLY" "$ALLOW_DEGRADED" \
+    "panel-font apply is refused"
 
 font_match=${KDE_RICE_FONT_MATCH:-}
 if [[ -z $font_match ]]; then
@@ -126,7 +131,8 @@ for source_directory in "$layout_source" "$active_source" "$workspace_source" "$
     [[ -d $source_directory && ! -L $source_directory ]] \
         || die "panel-font source directory is missing or unsafe: $source_directory"
 done
-for source_file in font-preflight.js font-layout.js font-postcheck.js font-restore.js; do
+for source_file in font-preflight.js font-capture.js font-layout.js font-postcheck.js \
+    font-restore.js font-restore-postcheck.js; do
     [[ -f $layout_source/contents/$source_file && ! -L $layout_source/contents/$source_file ]] \
         || die "panel-font layout source is incomplete: $source_file"
 done
@@ -154,7 +160,14 @@ marker_field() {
     return 1
 }
 
-printf 'Minimalist panel font policy mode: %s\n' "$($APPLY && printf APPLY || printf 'DRY RUN')"
+if ! $APPLY; then
+    policy_mode='DRY RUN'
+elif $STAGE_NEXT_LOGIN; then
+    policy_mode='STAGE NEXT LOGIN'
+else
+    policy_mode='APPLY'
+fi
+printf 'Minimalist panel font policy mode: %s\n' "$policy_mode"
 printf 'Target home: %s\n' "$TARGET_HOME"
 printf '\n1. Current topology and font state (read-only)\n'
 preflight=$(evaluate_plasma_script "$(< "$layout_source/contents/font-preflight.js")")
@@ -163,16 +176,65 @@ printf '%s\n' "$preflight"
     && $preflight == *" topologyOk=true "* \
     && $preflight == *" geometryOk=true "* \
     && $preflight == *" anchorsReady=true "* \
+    && $preflight == *" projectGeometryOk=true "* \
     && $preflight == *" customTypesKnown=true "* ]] \
     || die "panel font policy requires the exact recognized 32px Workspaces target"
 initial_font_state=$(marker_field "$preflight" fontState) \
     || die "panel font preflight omitted its exact source state"
 case "$initial_font_state" in source | target) ;; *) die "unknown panel font state" ;; esac
+initial_ui_state=$(marker_field "$preflight" uiState) \
+    || die "panel font preflight omitted its exact Chimera UI state"
+case "$initial_ui_state" in source | target) ;; *) die "unknown Chimera UI state" ;; esac
+initial_ui_revision=$(marker_field "$preflight" uiRevision) \
+    || die "panel font preflight omitted its exact Chimera UI revision"
+case "$initial_ui_revision" in 0 | 1 | 2) ;; *) die "unknown Chimera UI revision" ;; esac
+if [[ $initial_font_state == source ]]; then
+    restore_font_revision=1
+    restore_clock_family="Noto Sans Mono"
+    restore_clock_literal='"Noto Sans Mono"'
+else
+    restore_font_revision=2
+    restore_clock_family="Noto Sans"
+    restore_clock_literal='"Noto Sans"'
+fi
+restore_ui_revision=$initial_ui_revision
+
+capture_output=$(evaluate_plasma_script \
+    "$(< "$layout_source/contents/font-capture.js")")
+case "$capture_output" in
+    MINIMALIST_CHIMERA_CAPTURE=*) ;;
+    *) die "project-applet state capture was malformed" ;;
+esac
+capture_json=${capture_output#MINIMALIST_CHIMERA_CAPTURE=}
+printf '%s\n' "$capture_json" | jq -e '
+    .schemaVersion == 1
+    and (.panelId | type == "number")
+    and (.orderedIds | type == "array" and length == 11)
+    and (.orderedTypes | type == "array" and length == 11)
+    and ([.workspace, .activeTitle, .resources]
+        | all(.id | type == "number")
+        and all(.geometry.y | type == "number")
+        and all(.geometry.height | type == "number")
+        and all(.userConfig | type == "object")
+        and all(.presentUserConfigKeys | type == "array"))
+' >/dev/null || die "project-applet state capture failed validation"
+capture_literal=$(printf '%s' "$capture_json" | jq -Rs .)
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 apply_id="$timestamp-panel-font-policy-$$"
 snapshot_path="$TARGET_HOME/.local/state/kde-rice/snapshots/$apply_id"
 displaced_path="$TARGET_HOME/.local/state/kde-rice/apply-displaced/$apply_id"
+capture_receipt="$displaced_path/chimera-refresh-capture.json"
+capture_sha256=$(printf '%s' "$capture_json" | sha256sum)
+capture_sha256=${capture_sha256%% *}
+capture_receipt_json=$(jq -cn \
+    --arg snapshotPath "$snapshot_path" \
+    --arg captureSha256 "$capture_sha256" \
+    --argjson capture "$capture_json" \
+    --arg expectedDesktops "$EXPECTED_DESKTOPS" \
+    '{schemaVersion: 1, snapshotPath: $snapshotPath,
+      captureSha256: $captureSha256, capture: $capture,
+      expectedDesktops: $expectedDesktops}')
 printf -v restore_preview '%q --backup %q --home %q' \
     "$SCRIPT_DIR/restore" "$snapshot_path" "$TARGET_HOME"
 printf -v restore_apply '%s --apply' "$restore_preview"
@@ -181,27 +243,47 @@ assert_parent_within_home "$TARGET_HOME" ".local/state/kde-rice/apply-displaced/
 
 printf '\n2. Complete change plan\n'
 printf '  current accepted topology: minimalist-v04-workspaces on one screen-0 top panel at 32 logical px\n'
+printf '  expected virtual desktops: %s (verification only; KWin count is preserved)\n' "$EXPECTED_DESKTOPS"
 printf '  current font state: %s\n' "$initial_font_state"
+printf '  current Chimera UI state: %s\n' "$initial_ui_state"
+printf '  current Chimera UI revision: %s\n' "$initial_ui_revision"
 printf '  selected Fedora family: Noto Sans (Regular; clock remains 11 pt/400)\n'
 printf '  managed asset writes:\n'
 printf '    %s -> %s\n' "$ACTIVE_SOURCE_RELATIVE" "$ACTIVE_TARGET_RELATIVE"
 printf '    %s -> %s\n' "$WORKSPACE_SOURCE_RELATIVE" "$WORKSPACE_TARGET_RELATIVE"
 printf '    %s -> %s\n' "$RESOURCE_SOURCE_RELATIVE" "$RESOURCE_TARGET_RELATIVE"
 printf '    %s -> %s\n' "$LAYOUT_SOURCE_RELATIVE" "$LAYOUT_TARGET_RELATIVE"
-printf '  managed Plasma config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
-if [[ $initial_font_state == source ]]; then
-    printf '  panel removals: exactly one active-title, one Workspaces, and one resource project widget\n'
-    printf '  panel additions: exactly the same three project widgets at their existing geometry anchors\n'
+if $STAGE_NEXT_LOGIN; then
+    printf '  managed Plasma config retained unchanged: %s\n' "$PANEL_CONFIG_RELATIVE"
 else
-    printf '  panel removals/additions: none (the exact font target is already live)\n'
+    printf '  managed Plasma config that may change: %s\n' "$PANEL_CONFIG_RELATIVE"
 fi
-printf '  project widget font policy writes: General/fontPolicyRevision=2; existing package revisions preserved\n'
-printf '  built-in Digital Clock write: Appearance/fontFamily=Noto Sans only\n'
+printf '  panel removals/additions: none (the existing panel containment is retained)\n'
+if $STAGE_NEXT_LOGIN; then
+    printf '  applet removals/additions: none (all live applet IDs, settings, and geometry are retained)\n'
+elif [[ $initial_font_state == source || $initial_ui_state == source ]]; then
+    printf '  applet removals: exactly one active-title, one Workspaces, and one resource project applet\n'
+    printf '  applet additions: exactly the same three project applets at their captured x anchors; all normalize to y=4,height=24\n'
+else
+    printf '  applet removals/additions: none (the exact font and Chimera UI target is already live)\n'
+fi
+if $STAGE_NEXT_LOGIN; then
+    printf '  project applet policy writes: none; current font/UI/package revisions remain live\n'
+    printf '  built-in Digital Clock write: none\n'
+    printf '  activation: the staged QML is loaded only by the next normal Plasma login\n'
+else
+    printf '  project applet policy writes: General/fontPolicyRevision=2 and General/chimeraUiRevision=2; existing package revisions preserved\n'
+    printf '  built-in Digital Clock write: Appearance/fontFamily=Noto Sans only\n'
+fi
 printf '  preserve: clock instance/calendar/time zones, widget order, task launchers, panel geometry, wallpaper, shortcuts, KWin, and display modes\n'
 printf '  snapshot before first write: complete exact-path scope from %s\n' "$MANIFEST"
 printf '  snapshot destination: %s\n' "$snapshot_path"
-if [[ $initial_font_state == source ]]; then
-    printf '  automatic failure rollback: restore the complete snapshot, then reload its three prior project packages and Noto Sans Mono clock family live\n'
+printf '  local recovery receipt after snapshot: %s\n' "$capture_receipt"
+printf '  recovery capture SHA-256: %s\n' "$capture_sha256"
+if $STAGE_NEXT_LOGIN; then
+    printf '  automatic failure rollback: restore the complete snapshot; no live widget was touched\n'
+elif [[ $initial_font_state == source || $initial_ui_state == source ]]; then
+    printf '  automatic failure rollback: restore the complete snapshot, then reload its three prior project packages and prior clock family live\n'
 else
     printf '  automatic failure rollback: restore the complete snapshot; no widget instance is replaced\n'
 fi
@@ -218,7 +300,7 @@ capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot"
 
 font_write_attempted=false
 apply_error() {
-    local status=$? restore_status=0 restore_result=
+    local status=$? restore_status=0 restore_result= restore_post_result=
     trap - EXIT
     set +e
     warn "panel-font apply stopped after an error; Plasma and KWin were not restarted"
@@ -226,10 +308,26 @@ apply_error() {
     restore_status=$?
     if ((restore_status == 0)); then
         warn "pre-apply managed files were restored automatically"
-        if [[ $initial_font_state == source && $font_write_attempted == true ]]; then
-            restore_result=$(evaluate_plasma_script "$(< "$layout_source/contents/font-restore.js")" 2>&1)
+        if [[ ( $initial_font_state == source || $initial_ui_state == source ) \
+            && $font_write_attempted == true ]]; then
+            printf -v restore_policy \
+                'var capturedRefreshState = JSON.parse(%s); var restoreFontRevision = %s; var restoreUiRevision = %s; var restoreClockFamily = %s;\n' \
+                "$capture_literal" "$restore_font_revision" \
+                "$restore_ui_revision" "$restore_clock_literal"
+            restore_result=$(evaluate_plasma_script \
+                "$restore_policy$(< "$layout_source/contents/font-restore.js")" 2>&1)
             if [[ $restore_result == *MINIMALIST_FONT_RESTORE_OK* ]]; then
-                warn "the three snapshotted project packages and prior clock family were reloaded live"
+                for attempt in {1..20}; do
+                    restore_post_result=$(evaluate_plasma_script \
+                        "$restore_policy$(< "$layout_source/contents/font-restore-postcheck.js")" 2>&1)
+                    [[ $restore_post_result == *MINIMALIST_FONT_RESTORE_POSTCHECK_OK* ]] && break
+                    ((attempt == 20)) || sleep 0.1
+                done
+                if [[ $restore_post_result == *MINIMALIST_FONT_RESTORE_POSTCHECK_OK* ]]; then
+                    warn "the three snapshotted project packages and prior clock family were reloaded and verified live"
+                else
+                    warn "live rollback returned, but its exact topology, settings, geometry, and clock policy could not all be verified"
+                fi
             else
                 warn "live package reload could not prove a safe exact target; no unrelated widget was removed"
             fi
@@ -240,6 +338,15 @@ apply_error() {
     exit "$status"
 }
 trap apply_error EXIT
+
+mkdir -p -- "$displaced_path"
+capture_receipt_temporary="$capture_receipt.kde-rice-new-$$"
+[[ ! -e $capture_receipt_temporary && ! -L $capture_receipt_temporary ]] \
+    || die "capture receipt temporary path already exists"
+printf '%s\n' "$capture_receipt_json" > "$capture_receipt_temporary"
+sync -f "$capture_receipt_temporary"
+mv -- "$capture_receipt_temporary" "$capture_receipt"
+sync -f "$capture_receipt"
 
 install_managed_directory() {
     local source=$1 target_relative=$2
@@ -271,31 +378,40 @@ printf '\n5. Rechecking the exact topology and source state before the live writ
 write_preflight=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-preflight.js")")
 printf '%s\n' "$write_preflight"
 [[ $write_preflight == *MINIMALIST_FONT_PREFLIGHT_OK* \
-    && $write_preflight == *" fontState=$initial_font_state "* ]] \
+    && $write_preflight == *" fontState=$initial_font_state "* \
+    && $write_preflight == *" uiState=$initial_ui_state "* \
+    && $write_preflight == *" uiRevision=$initial_ui_revision "* ]] \
     || die "panel or font state changed before the guarded live write"
 
-printf '\n6. Refreshing the project widgets and built-in clock font\n'
-font_write_attempted=true
-layout_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-layout.js")")
-printf '%s\n' "$layout_result"
-[[ $layout_result == *MINIMALIST_FONT_LAYOUT_OK* ]] \
-    || die "Plasma did not confirm the panel font write"
+if $STAGE_NEXT_LOGIN; then
+    printf '\n6. Staging only; leaving the live panel, applets, geometry, and clock untouched\n'
+else
+    printf '\n6. Refreshing the project applets and built-in clock font\n'
+    font_write_attempted=true
+    printf -v writer_policy \
+        'var capturedRefreshState = JSON.parse(%s);\n' "$capture_literal"
+    layout_result=$(evaluate_plasma_script \
+        "$writer_policy$(< "$layout_destination/contents/font-layout.js")")
+    printf '%s\n' "$layout_result"
+    [[ $layout_result == *MINIMALIST_FONT_LAYOUT_OK* ]] \
+        || die "Plasma did not confirm the panel font write"
 
-printf '\n7. Read-only panel-font postcheck\n'
-post_result=
-for attempt in {1..20}; do
-    post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-postcheck.js")")
-    [[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] && break
-    ((attempt == 20)) || sleep 0.1
-done
-printf '%s\n' "$post_result"
-[[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] \
-    || die "live panel font topology or policy did not settle to the exact target"
+    printf '\n7. Read-only panel-font postcheck\n'
+    post_result=
+    for attempt in {1..20}; do
+        post_result=$(evaluate_plasma_script "$(< "$layout_destination/contents/font-postcheck.js")")
+        [[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] && break
+        ((attempt == 20)) || sleep 0.1
+    done
+    printf '%s\n' "$post_result"
+    [[ $post_result == *MINIMALIST_FONT_POSTCHECK_OK* ]] \
+        || die "live panel font topology or policy did not settle to the exact target"
+fi
 
 printf '\n8. Repository read-only verification\n'
 set +e
 verify_output=$("$VERIFY_COMMAND" --home "$TARGET_HOME" \
-    --panel-target minimalist-v04-workspaces --json 2>&1)
+    --panel-target minimalist-v04-workspaces --expected-desktops "$EXPECTED_DESKTOPS" --json 2>&1)
 verify_status=$?
 set -e
 printf '%s\n' "$verify_output"
@@ -308,10 +424,19 @@ if ((verify_status != 0)); then
 fi
 
 trap - EXIT
-printf '\nMinimalist panel font policy apply complete.\n'
+if $STAGE_NEXT_LOGIN; then
+    printf '\nMinimalist Chimera assets staged for the next Plasma login.\n'
+else
+    printf '\nMinimalist panel font policy apply complete.\n'
+fi
 printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
 printf 'Restore preview: %s\n' "$restore_preview"
 printf 'Restore apply: %s\n' "$restore_apply"
 if [[ -d $displaced_path ]]; then printf 'Replaced managed assets: %s\n' "$displaced_path"; fi
-printf 'Result: active title, Workspaces, resources, and Digital Clock use Noto Sans.\n'
+if $STAGE_NEXT_LOGIN; then
+    printf 'Result: the new Chimera packages and layout are installed on disk; live applet IDs, revisions, settings, geometry, and clock remain unchanged until the next normal Plasma login.\n'
+else
+    printf 'Result: active title, Workspaces, and resources are configured for Chimera UI revision 2 at y=4,height=24; all four panel text surfaces are configured for Noto Sans.\n'
+    printf 'Rendered QML is not attested by policy markers. If the appearance is stale, save work and use a normal logout/login.\n'
+fi
 printf 'No other widget, panel geometry, task launcher, KWin state, shortcut, wallpaper, display mode, Plasma process, or KWin process was changed.\n'

@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 2,
+  "widgets": {
+    "launcher": "org.kde.plasma.kickoff",
+    "title": "org.kde.minimalist.activewindowtitle",
+    "spacer": "org.kde.plasma.panelspacer",
+    "tasks": "org.kde.plasma.icontasks",
+    "resources": "org.kde.minimalist.resources",
+    "margin": "org.kde.plasma.marginsseparator",
+    "input": "org.kde.plasma.kimpanel",
+    "tray": "org.kde.plasma.systemtray",
+    "clock": "org.kde.plasma.digitalclock",
+    "pager": "org.kde.plasma.pager",
+    "workspaces": "org.kde.minimalist.workspaces"
+  },
+  "roles": {
+    "launcher": "launcher",
+    "title": "title",
+    "tasks": "tasks",
+    "resources": "resources",
+    "margin": "margin",
+    "input": "input",
+    "tray": "tray",
+    "clock": "clock",
+    "pager": "pager",
+    "workspaces": "workspaces",
+    "leftSpacer": "spacer",
+    "rightSpacer": "spacer"
+  },
+  "sequences": {
+    "v03Widgets": [
+      "launcher",
+      "title",
+      "leftSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ],
+    "stagedWidgets": [
+      "launcher",
+      "title",
+      "leftSpacer",
+      "rightSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ],
+    "taskFrontStagedWidgets": [
+      "tasks",
+      "launcher",
+      "title",
+      "leftSpacer",
+      "rightSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ],
+    "v04Widgets": [
+      "launcher",
+      "title",
+      "leftSpacer",
+      "tasks",
+      "rightSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ],
+    "v04PagerWidgets": [
+      "launcher",
+      "pager",
+      "title",
+      "leftSpacer",
+      "tasks",
+      "rightSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ],
+    "v04WorkspacesWidgets": [
+      "launcher",
+      "workspaces",
+      "title",
+      "leftSpacer",
+      "tasks",
+      "rightSpacer",
+      "resources",
+      "margin",
+      "input",
+      "tray",
+      "clock"
+    ]
+  }
+}

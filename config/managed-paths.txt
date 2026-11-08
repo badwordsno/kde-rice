@@ -6,7 +6,6 @@
 # KDE and Plasma configuration files that later phases may edit.
 .config/kdeglobals
 .config/kwinrc
-.config/kcminputrc
 .config/plasmarc
 .config/plasma-org.kde.plasma.desktop-appletsrc
 .config/plasmashellrc

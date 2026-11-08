@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+SOURCE_ROOT=$REPO_ROOT
+OUTPUT_DIR=$REPO_ROOT/dist
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/build-source-release [OPTIONS]
+
+Build the deterministic, allowlist-only public source archive.
+
+Options:
+  --source ABSOLUTE_PATH  Source tree (default: this checkout; tests only)
+  --output PATH           Output directory (default: ./dist)
+  -h, --help              Show this help
+
+The builder never reads Git history and never includes a file that is absent
+from release/source-manifest.txt.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+while (($#)); do
+    case "$1" in
+        --source)
+            (($# >= 2)) || die "--source requires a path"
+            SOURCE_ROOT=$2
+            shift 2
+            ;;
+        --output)
+            (($# >= 2)) || die "--output requires a path"
+            OUTPUT_DIR=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+for command_name in realpath mktemp install mkdir tar xz sha256sum awk grep sort find cmp; do
+    command -v "$command_name" >/dev/null 2>&1 \
+        || die "required command not found: $command_name"
+done
+
+[[ $SOURCE_ROOT == /* && -d $SOURCE_ROOT && ! -L $SOURCE_ROOT ]] \
+    || die "source must be an existing absolute non-symlink directory"
+SOURCE_ROOT=$(realpath -e -- "$SOURCE_ROOT") || die "source could not be resolved"
+case "$SOURCE_DATE_EPOCH" in
+    '' | *[!0-9]*) die "SOURCE_DATE_EPOCH must be a non-negative integer" ;;
+esac
+
+VERSION_FILE="$SOURCE_ROOT/VERSION"
+MANIFEST="$SOURCE_ROOT/release/source-manifest.txt"
+DENYLIST="$SOURCE_ROOT/release/nonredistributable-payloads.sha256"
+[[ -f $VERSION_FILE && ! -L $VERSION_FILE ]] || die "VERSION is missing or unsafe"
+[[ -f $MANIFEST && ! -L $MANIFEST ]] || die "public release manifest is missing or unsafe"
+[[ -f $DENYLIST && ! -L $DENYLIST ]] || die "payload denylist is missing or unsafe"
+
+# Validate source-only generated constants without executing fixture code.
+"$SCRIPT_DIR/sync-panel-contract" --check --source "$SOURCE_ROOT"
+
+for package in \
+    org.kde.minimalist.activewindowtitle \
+    org.kde.minimalist.resources \
+    org.kde.minimalist.workspaces; do
+    for component in ChimeraFrame.qml ChimeraTokens.qml; do
+        canonical="$SOURCE_ROOT/design/chimera/$component"
+        generated="$SOURCE_ROOT/plasmoids/$package/contents/ui/chimera/$component"
+        [[ -f $canonical && ! -L $canonical && -f $generated && ! -L $generated ]] \
+            || die "Chimera component source or generated copy is missing or unsafe"
+        cmp -s -- "$canonical" "$generated" \
+            || die "stale generated Chimera component: $generated"
+    done
+done
+
+version=$(< "$VERSION_FILE")
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+    || die "VERSION is not a release version: $version"
+package_root="minimalist-black-kde-$version"
+archive_name="$package_root.tar.xz"
+
+if [[ $OUTPUT_DIR != /* ]]; then
+    OUTPUT_DIR="$PWD/$OUTPUT_DIR"
+fi
+[[ ! -L $OUTPUT_DIR ]] || die "refusing a symlinked output directory"
+OUTPUT_DIR=$(realpath -m -- "$OUTPUT_DIR") || die "output path could not be normalized"
+[[ $OUTPUT_DIR != / ]] || die "unsafe output directory"
+mkdir -p -- "$OUTPUT_DIR"
+OUTPUT_DIR=$(realpath -e -- "$OUTPUT_DIR") || die "output directory could not be resolved"
+[[ ! -L $OUTPUT_DIR/$archive_name ]] || die "refusing to replace a symlinked archive"
+[[ ! -L $OUTPUT_DIR/$archive_name.sha256 ]] || die "refusing to replace a symlinked checksum"
+
+temp_root=$(mktemp -d /tmp/minimalist-black-kde-release.XXXXXX)
+cleanup() {
+    case "$temp_root" in
+        /tmp/minimalist-black-kde-release.*) rm -rf -- "$temp_root" ;;
+    esac
+}
+trap cleanup EXIT
+stage_root="$temp_root/$package_root"
+mkdir -p -- "$stage_root"
+
+declare -A seen=()
+declare -a release_paths=()
+while IFS= read -r relative || [[ -n $relative ]]; do
+    case "$relative" in
+        '' | \#*) continue ;;
+    esac
+    [[ $relative =~ ^[A-Za-z0-9._/+:-]+$ ]] \
+        || die "manifest path contains unsupported characters: $relative"
+    [[ $relative != /* && $relative != */ && $relative != ./* ]] \
+        || die "manifest path is not a normalized relative file: $relative"
+    IFS=/ read -r -a path_parts <<< "$relative"
+    for part in "${path_parts[@]}"; do
+        [[ -n $part && $part != . && $part != .. ]] \
+            || die "manifest path contains an unsafe segment: $relative"
+    done
+    [[ -z ${seen[$relative]+x} ]] || die "duplicate manifest path: $relative"
+    seen[$relative]=1
+
+    source_file="$SOURCE_ROOT/$relative"
+    [[ -f $source_file && ! -L $source_file ]] \
+        || die "manifest entry is not a regular non-symlink file: $relative"
+    [[ $(realpath -e -- "$source_file") == "$source_file" ]] \
+        || die "manifest entry traverses a symlink: $relative"
+    release_paths+=("$relative")
+done < "$MANIFEST"
+((${#release_paths[@]} > 0)) || die "public release manifest is empty"
+
+mapfile -t sorted_paths < <(printf '%s\n' "${release_paths[@]}" | LC_ALL=C sort)
+[[ $(printf '%s\n' "${release_paths[@]}") == "$(printf '%s\n' "${sorted_paths[@]}")" ]] \
+    || die "public release manifest must be sorted"
+
+for relative in "${release_paths[@]}"; do
+    source_file="$SOURCE_ROOT/$relative"
+    destination="$stage_root/$relative"
+    if [[ -x $source_file ]]; then
+        mode=0755
+    else
+        mode=0644
+    fi
+    install -D -m "$mode" -- "$source_file" "$destination"
+done
+
+# Assemble policy literals without embedding a complete forbidden marker in
+# the public builder itself. Every staged file, including tests and builders,
+# is scanned as bytes; there are no blanket path exceptions.
+forbidden_content_pattern='Minimalist''V02|PRIVATE-''ASSET|Propriet''ary|assets/wall''papers|/ho''me/|/Us''ers/|[A-Za-z]:\\Us''ers\\|BEGIN (RSA |OPENSSH |EC )?PRIVATE ''KEY'
+while IFS= read -r -d '' staged_file; do
+    relative=${staged_file#"$stage_root/"}
+    if LC_ALL=C grep -aEnq "$forbidden_content_pattern" "$staged_file" >/dev/null 2>&1; then
+        die "public release contains a forbidden archival or credential marker: $relative"
+    fi
+done < <(find "$stage_root" -type f -print0)
+
+declare -A forbidden_hash=()
+while IFS= read -r digest rest || [[ -n ${digest:-} ]]; do
+    case "${digest:-}" in
+        '' | \#*) continue ;;
+    esac
+    [[ $digest =~ ^[0-9a-f]{64}$ ]] || die "malformed payload hash denylist"
+    forbidden_hash[$digest]=1
+done < "$DENYLIST"
+while IFS= read -r -d '' staged_file; do
+    digest=$(sha256sum -- "$staged_file")
+    digest=${digest%% *}
+    [[ -z ${forbidden_hash[$digest]+x} ]] \
+        || die "public release contains an excluded archival payload"
+done < <(find "$stage_root" -type f -print0)
+
+archive_temp="$temp_root/$archive_name"
+LC_ALL=C TZ=UTC tar \
+    --sort=name \
+    --format=gnu \
+    --mtime="@$SOURCE_DATE_EPOCH" \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    --mode='u+rwX,go+rX,go-w' \
+    -C "$temp_root" \
+    -cf - "$package_root" |
+    xz --threads=1 --check=crc64 -9e > "$archive_temp"
+
+install -m 0644 -- "$archive_temp" "$OUTPUT_DIR/$archive_name"
+digest=$(sha256sum -- "$OUTPUT_DIR/$archive_name")
+digest=${digest%% *}
+printf '%s  %s\n' "$digest" "$archive_name" > "$OUTPUT_DIR/$archive_name.sha256"
+
+printf 'public source archive: %s\n' "$OUTPUT_DIR/$archive_name"
+printf 'SHA-256: %s\n' "$digest"

@@ -74,7 +74,7 @@ if rg -n 'writeConfig\("AppletOrder"|\.index[[:space:]]*=' \
 fi
 grep -Fq 'MINIMALIST_V04_POSTCHECK_OK' "$LAYOUT/contents/postcheck.js" \
     || fail "v0.4.1 postcheck marker is missing"
-grep -Fq '"$DOCTOR_COMMAND" --target minimalist-v04' "$APPLY_SCRIPT" \
+grep -Fq 'require_component_diagnosis "$DOCTOR_COMMAND" minimalist-v04' "$APPLY_SCRIPT" \
     || fail "v0.4.1 apply does not request the v0.4.1 doctor target"
 grep -Fq 'capture_or_reuse_snapshot' "$APPLY_SCRIPT" \
     || fail "v0.4.1 apply no longer preserves transaction snapshot reuse"
@@ -104,12 +104,34 @@ if rg -n '(^|[[:space:]])(sudo|pkexec|pacman|dnf|apt-get|killall|pkill|systemctl
     fail "v0.4.1 apply contains a privileged, package, or restart command"
 fi
 
-"$NODE_BIN" - "$LAYOUT" <<'NODE'
+# Move the clock near the front in a disposable contract to exercise every
+# generated role index without changing the checked-in desktop topology.
+python3 - "$REPO_ROOT" "$TEMP_ROOT/reordered" <<'PY'
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+repo, target = map(Path, sys.argv[1:])
+for relative in ("design/panel", "layouts/plasma/org.kde.minimalist-v04/contents"):
+    shutil.copytree(repo / relative, target / relative)
+contract_path = target / "design/panel/v04.json"
+contract = json.loads(contract_path.read_text())
+for sequence in contract["sequences"].values():
+    sequence.remove("clock")
+    sequence.insert(sequence.index("launcher") + 1, "clock")
+contract_path.write_text(json.dumps(contract))
+subprocess.run([str(repo / "scripts/sync-panel-contract"), "--write", "--source", str(target)], check=True)
+subprocess.run([str(repo / "scripts/sync-panel-contract"), "--check", "--source", str(target)], check=True)
+PY
+
+"$NODE_BIN" - "$LAYOUT" "$TEMP_ROOT/reordered/layouts/plasma/org.kde.minimalist-v04" <<'NODE'
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
 const layoutRoot = process.argv[2];
+const reorderedRoot = process.argv[3];
 const spacerType = "org.kde.plasma.panelspacer";
 const taskType = "org.kde.plasma.icontasks";
 const resourceType = "org.kde.minimalist.resources";
@@ -381,7 +403,7 @@ function run(name, panel, options = {}) {
         JSON, String, Number, Math, Array, Object, Error
     };
     vm.runInNewContext(
-        fs.readFileSync(path.join(layoutRoot, "contents", name), "utf8"),
+        fs.readFileSync(path.join(options.layoutRoot || layoutRoot, "contents", name), "utf8"),
         context,
         {filename: name}
     );
@@ -669,6 +691,63 @@ try {
 }
 assert(capabilityRefused && digest(missingCapability) === missingCapabilityBefore,
     "missing task capability was not refused before mutation");
+
+// Independent fixtures move the clock after the launcher, shifting policy and
+// placement roles. These expectations do not read the generated contract.
+function moveClock(types) {
+    const result = types.filter(type => type !== "org.kde.plasma.digitalclock");
+    result.splice(result.indexOf("org.kde.plasma.kickoff") + 1, 0, "org.kde.plasma.digitalclock");
+    return result;
+}
+function runReordered(name, panel) {
+    return run(name, panel, {layoutRoot: reorderedRoot});
+}
+const reorderedV03 = moveClock(v03Types);
+const reorderedV04 = moveClock(v04Types);
+const reordered = createPanel(reorderedV03);
+const retainedSpacer = reordered.widgets(spacerType)[0];
+assert(runReordered("preflight.js", reordered).includes("topology=minimalist-v03"),
+    "reordered source was not recognized by preflight");
+runReordered("stage-spacer.js", reordered);
+assert(JSON.stringify(orderedTypes(reordered)) === JSON.stringify(moveClock(stagedTypes)),
+    "reordered spacer phase used the wrong placement anchor");
+runReordered("layout.js", reordered);
+assertTargetPolicy(reordered, "reordered migration", reorderedV04);
+assert(runReordered("postcheck.js", reordered).includes("MINIMALIST_V04_POSTCHECK_OK"),
+    "reordered postcheck inspected a stale policy position");
+for (const [type, key, value, result] of [
+    [taskType, "General:fill", true, "taskPolicyOk=false"],
+    [resourceType, "General:packageRevision", 0, "resourceOk=false"],
+    ["org.kde.plasma.digitalclock", "Appearance:showDate", true, "clockOk=false"]
+]) {
+    const widget = reordered.widgets(type)[0];
+    const saved = widget.config[key];
+    widget.config[key] = value;
+    const before = digest(reordered);
+    const output = runReordered("postcheck.js", reordered);
+    assert(output.includes(result) && !output.includes("MINIMALIST_V04_POSTCHECK_OK"),
+        "reordered postcheck missed policy drift for " + type);
+    assert(digest(reordered) === before, "reordered postcheck mutated policy");
+    widget.config[key] = saved;
+}
+runReordered("cleanup.js", reordered);
+assert(JSON.stringify(orderedTypes(reordered)) === JSON.stringify(reorderedV03)
+    && reordered.widgets(spacerType)[0] === retainedSpacer,
+    "reordered cleanup did not preserve the original spacer and widgets");
+for (const types of [stagedTypes, taskFrontStagedTypes]) {
+    const intermediate = createPanel(moveClock(types));
+    runReordered("cleanup.js", intermediate);
+    assert(JSON.stringify(orderedTypes(intermediate)) === JSON.stringify(reorderedV03),
+        "reordered intermediate cleanup used a stale removal position");
+}
+for (const types of [pagerTypes, workspacesTypes]) {
+    const shifted = moveClock(types);
+    const panel = createPanel(shifted);
+    runReordered("layout.js", panel);
+    assertTargetPolicy(panel, "reordered optional variant", shifted);
+    assert(runReordered("postcheck.js", panel).includes("MINIMALIST_V04_POSTCHECK_OK"),
+        "reordered optional widget was checked at a stale position");
+}
 NODE
 
 cat > "$MOCK_BIN/doctor" <<'MOCK'

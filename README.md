@@ -1,74 +1,76 @@
 # Minimalist Black for KDE Plasma 6
 
-Minimalist Black for KDE Plasma 6, shipped in two deliberately different
-editions.
+Minimalist Black configures a black/Breeze KDE desktop with a compact native
+Plasma panel, three project widgets, Konsole, and Fastfetch. It ships as one
+public source archive with a guarded apply and recovery workflow.
 
-![Minimalist Black preview](packages/store/io.github.badwordsno.minimalistblack/contents/previews/fullscreenpreview.jpg)
+![Minimalist Black daily-use illustration](docs/images/minimalist-black.jpg)
 
-| Edition | Delivery | Changes | Safety model |
-| --- | --- | --- | --- |
-| **KDE Store** | Native `Plasma/LookAndFeel` package | Embedded black color scheme, Breeze widget style, Plasma Style, and window decoration | No layout, wallpaper, custom widget, script, display, or shortcut changes |
-| **GitHub Extended** | Reviewed shell workflow | Store appearance plus Konsole, Fastfetch, two project Plasmoids, and a guarded one-panel layout | Read-only diagnosis, complete plan, exact-path snapshot, explicit apply, verification, and rollback |
+This illustrative view shows the panel, Dolphin, Konsole, and Fastfetch together.
+The depicted wallpaper is user-owned and is not distributed or managed.
+The illustration uses the earlier purple accent; the current source palette
+uses blue `#007ACC`.
 
-Version `1.0.0` is a release candidate. The package and source archives can be
-built and tested locally, and the verified clean-history source may be
-published as an untagged public RC. A tagged v1.0.0 release, downloadable
-release artifacts, and KDE Store publication remain blocked until the native
-Fedora and Arch-family acceptance checklist in [Release](docs/RELEASE.md)
-passes.
+Version `1.0.0` remains a release candidate. Automated checks and a verified
+public source archive do not replace the Fedora and Arch-family native
+acceptance checklist in [Release](docs/RELEASE.md).
 
-## KDE Store edition
+## Desktop components
 
-The Store package is self-contained and intentionally small. Applying it sets:
+Minimalist Black ships and installs three project Plasmoid packages. Active Window
+Title and Resource Usage are present on the base panel; Workspaces supports the
+optional project-owned Workspaces final variant. The alternative Pager variant
+uses Plasma's built-in Pager, not a fourth project package. Bootstrap adds
+neither optional switcher to the base target. If an exact Pager or Workspaces
+final variant is already active, it preserves and verifies that exact variant.
+Pinned launchers and the current wallpaper remain user-owned and are preserved.
 
-- the embedded `KdeRiceStoreBlack` color scheme;
-- Breeze application style;
-- Breeze Plasma Style;
-- Breeze window decoration.
+### Chimera widget layer
 
-It does **not** contain `contents/layouts`, so Plasma's “use desktop layout from
-theme” path cannot replace the user's panel. It also contains no wallpaper,
-icons, cursor, fonts, splash screen, Konsole profile, Fastfetch config, custom
-Plasmoid, executable, or install hook.
+The three project widgets now share one generated, package-local Chimera QML
+grammar: a 2 px grid, square raised/sunken edges, one accent state rail, and a
+separate keyboard-focus outline. Each package remains self-contained while the
+release gate rejects drift from the canonical source in
+[design/chimera](design/chimera/README.md).
 
-The package source is
-[`packages/store/io.github.badwordsno.minimalistblack`](packages/store/io.github.badwordsno.minimalistblack).
-Build the exact KDE Store archive with:
+Their normal Plasma configuration dialogs expose title templates, icon and
+width policy, guarded window controls, metric order/visibility/update rate and
+thresholds, workspace labels, single-desktop visibility, and wheel wrapping or
+inversion. Widget refresh and failure recovery preserve those user-owned keys.
+The private volume backend is isolated behind a Loader so its absence disables
+only VOL rather than the complete resource strip.
 
-```bash
-scripts/build-store-release --output dist
-```
-
-Installing a package does not apply it. Applying or reverting a Global Theme is
-a live desktop change and is left to System Settings. Revert to the previous
-installed Global Theme (or Breeze if it is unavailable) before uninstalling
-Minimalist Black. A Global Theme can restore only the components it owns; exact
-pre-change restoration is an Extended-edition feature.
-
-## GitHub Extended edition
-
-Extended adds the compact top panel, native CPU/RAM/GPU/VOL readout, active
-window title, Konsole profile, and privacy-safe Fastfetch presentation. Pinned
-launchers remain user-owned. The current wallpaper is also user-owned and is
-preserved. An already exact Pager or Workspaces final variant is likewise
-preserved and verified rather than removed.
+No external theme or Plasmoid source is copied into this layer. The reviewed
+upstream commits, file-level license decisions, and planned MIT/GPL boundaries
+are recorded in [the Chimera component catalog](research/chimera-components.json)
+and [third-party notices](THIRD_PARTY_NOTICES.md).
 
 The `minimalist-v04` / `v0.4.1` strings retained by the scripts identify the
 panel-topology contract and migration lineage. The distributable product
 version is the root `VERSION` value (`1.0.0`).
 
+## Normal workflow
+
+Use `doctor`, `bootstrap`, `verify`, and `restore` as the normal entry points.
+Versioned apply commands are migration components; see
+[Architecture](docs/ARCHITECTURE.md) for their roles.
+
 Clone the public source, then run the normal workflow from the target user's
 Plasma 6 Wayland session:
 
 ```bash
-git clone https://github.com/badwordsno/minimalist-black-kde.git
-cd minimalist-black-kde
+git clone https://github.com/badwordsno/kde-rice.git
+cd kde-rice
 scripts/doctor --target minimalist-v04
 scripts/bootstrap
 # Review the complete plan and rollback command before the live action:
 scripts/bootstrap --apply
 scripts/verify --panel-target minimalist-v04
 ```
+
+The final command shows the base target. If bootstrap preserves an exact Pager
+or Workspaces final variant, use the exact `minimalist-v04-pager` or
+`minimalist-v04-workspaces` target printed by its plan and receipt.
 
 Plain `scripts/bootstrap` is always a dry run. Before its first live write,
 `--apply` snapshots every path in
@@ -77,28 +79,39 @@ environment or unknown panel topology is refused. A documented degraded path
 requires the separate `--allow-degraded` acknowledgement, and it cannot
 override a missing required capability or unknown topology.
 
-Restore is preview-first:
+Restore replaces complete managed files, including any settings changed in
+those files after the snapshot. Review its preview before applying:
 
 ```bash
 scripts/restore --backup /absolute/path/to/snapshot
 scripts/restore --backup /absolute/path/to/snapshot --apply
 ```
 
+New snapshots use format 2 with a SHA-256 content checksum covering the payload
+and its path/type manifests. Restore checks it before displacing any file,
+then compares restored contents with the baseline before reporting success.
+Format-1 snapshots remain readable with an explicit integrity warning.
+Snapshot and restore enforce the same canonical XDG roots as bootstrap.
+Mutating commands share a nonblocking `flock` on the existing home directory;
+nested components inherit it, and a second operation is refused without writes.
+
 Existing targets are moved into recoverable displaced state rather than
 deleted. Plasma and KWin are never restarted automatically. Resolution, scale,
 output placement, refresh rate, HDR, VRR, shortcuts, and unrelated user files
 remain outside the managed boundary.
 
+## Build
+
 Build the clean public source archive with:
 
 ```bash
-scripts/build-extended-release --output dist
+scripts/build-release --output dist
 ```
 
-To produce both versioned artifacts plus one verified checksum manifest in a
-single step, run `scripts/build-release --output dist`.
+This creates `minimalist-black-kde-<version>.tar.xz`, its checksum sidecar,
+and `SHA256SUMS`. `scripts/build-source-release` is the internal source builder.
 
-The Extended builder copies only the exact public allowlist, normalizes archive
+The source builder copies only the exact public allowlist, normalizes archive
 metadata, and rejects symlinks, traversal, private payload hashes, or archival
 material. A public GitHub repository must begin from that verified archive as a
 new history. Do not change this recovery checkout's visibility: its historical
@@ -108,10 +121,7 @@ objects are intentionally outside the public release boundary.
 
 Compatibility is capability-based rather than distribution-name-based.
 
-- Store metadata targets Plasma 6.0 or newer and uses only native Breeze and
-  embedded LookAndFeel facilities. Native release acceptance is still required
-  on Fedora and an Arch-family system.
-- Extended's live-confirmed panel contract is Plasma/KWin 6.7.x on a Plasma
+- The workflow's live-confirmed panel contract is Plasma/KWin 6.7.x on a Plasma
   Wayland session with one known base, Pager, or Workspaces final panel.
   Other Plasma 6 minors are degraded until observed; Plasma 5 and future major
   versions are unsupported.
@@ -127,26 +137,37 @@ two native acceptance lanes for this release candidate. See
 
 ## Tests and release boundary
 
+Run `scripts/check-release` for the automated gate: candidate tests and syntax,
+the offscreen readability check, two matching release builds with checksum
+verification, and tests and syntax
+from the extracted public source. Logs and local artifacts remain in its
+printed temporary directory. This command does not apply a theme, install
+prerequisites, or publish artifacts; native acceptance remains separate.
+
+
 ```bash
 set -e
 for test_script in tests/test-*.sh; do
   bash "$test_script"
 done
-find scripts tests -type f -print0 |
-  while IFS= read -r -d '' shell_file; do
-    bash -n "$shell_file"
-  done
+python3 tests/test-panel-readability.py
+for shell_file in scripts/* scripts/lib/*.sh tests/*.sh tests/lib/*.sh; do
+  [[ -f "$shell_file" ]] || continue
+  bash -n "$shell_file"
+done
 git diff --check
 ```
 
-Qt 6 `qmllint` is a release-test dependency, not an Extended runtime
+Qt 6 `qmllint` is a release-test dependency, not a desktop runtime
 dependency. Missing it leaves the complete repository gate blocked; this
 project never installs it automatically. Tests use temporary homes and mocked
-Plasma interfaces and must never target the real desktop.
+Plasma interfaces and must never target the real desktop. Missing visual-test
+dependencies are reported as `NOT RUN` and leave `check-release` incomplete
+(exit 77), rather than producing a full pass.
 
 The maintainer's separate private recovery checkout contains archival artwork
 with unresolved redistribution rights. It is not included in this public
-source or either public artifact, and is not covered by the MIT license. See
+source or the public artifact, and is not covered by the MIT license. See
 [Licensing boundary](LICENSES.md),
-[Editions](docs/EDITIONS.md), [Testing](docs/TESTING.md), and
+[Scope](docs/SCOPE.md), [Testing](docs/TESTING.md), and
 [Release](docs/RELEASE.md).

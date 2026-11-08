@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+MODE=check
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/sync-chimera-components [--check|--write]
+
+Keep the package-local Chimera QML runtime components byte-identical to the
+canonical files in design/chimera. The default mode is --check.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+while (($#)); do
+    case "$1" in
+        --check | --write)
+            MODE=${1#--}
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+for command_name in cmp install mkdir; do
+    command -v "$command_name" >/dev/null 2>&1 \
+        || die "required command not found: $command_name"
+done
+
+source_root="$REPO_ROOT/design/chimera"
+packages=(
+    org.kde.minimalist.activewindowtitle
+    org.kde.minimalist.resources
+    org.kde.minimalist.workspaces
+)
+components=(ChimeraFrame.qml ChimeraTokens.qml)
+
+for package in "${packages[@]}"; do
+    target_root="$REPO_ROOT/plasmoids/$package/contents/ui/chimera"
+    if [[ $MODE == write ]]; then
+        mkdir -p -- "$target_root"
+    fi
+    for component in "${components[@]}"; do
+        source_file="$source_root/$component"
+        target_file="$target_root/$component"
+        [[ -f $source_file && ! -L $source_file ]] \
+            || die "canonical component is missing or unsafe: $component"
+        if [[ $MODE == write ]]; then
+            [[ ! -L $target_file ]] || die "refusing a symlinked target: $target_file"
+            install -m 0644 -- "$source_file" "$target_file"
+        else
+            [[ -f $target_file && ! -L $target_file ]] \
+                || die "generated component is missing or unsafe: $target_file"
+            cmp -s -- "$source_file" "$target_file" \
+                || die "generated component is stale: $target_file"
+        fi
+    done
+done
+
+if [[ $MODE == write ]]; then
+    result=synchronized
+else
+    result=current
+fi
+printf 'Chimera components are %s.\n' "$result"

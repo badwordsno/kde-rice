@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "reviewedAt": "2026-08-30",
+  "policy": {
+    "coreLicense": "MIT",
+    "sourceArtifact": "MIT-only",
+    "externalCodeIncluded": false,
+    "integrationRule": "Copy only file-level audited permissive code; keep GPL packages separate or reimplement behavior independently without copying source or assets."
+  },
+  "components": [
+    {
+      "id": "cde-plasma",
+      "repository": "https://github.com/spacestate1/cde-plasma",
+      "commit": "844e15f5bc21e1abbcfbfedb3fdfa525b3bf6301",
+      "license": "mixed: MIT KDecoration/KStyle and GPL-2.0-or-later Commonality Plasma themes",
+      "decision": "future-file-level-vendor",
+      "use": "Square bevel and dense metric behavior; never import Commonality SVG files as MIT."
+    },
+    {
+      "id": "klassy",
+      "repository": "https://github.com/paulmcauley/klassy",
+      "commit": "2b4b6fd283b0400a230780267beaf5b9da6556ce",
+      "license": "mixed file-level SPDX",
+      "decision": "behavior-reference-only",
+      "use": "Zero-radius outlines, full-height title buttons, and title/app continuity."
+    },
+    {
+      "id": "darkly",
+      "repository": "https://github.com/Bali10050/Darkly",
+      "commit": "65f6fa62675e3c30986f8fc8e4fdbba053096491",
+      "license": "mixed; GPL package with file-level permissive exceptions",
+      "decision": "behavior-reference-only",
+      "use": "Dense classic controls, framed divisions, tab strips, and scrollbar affordances."
+    },
+    {
+      "id": "oxygen",
+      "repository": "https://github.com/KDE/oxygen",
+      "commit": "88c10f233bdcc4679996527c78fc7deb674614a5",
+      "license": "mixed file-level SPDX",
+      "decision": "behavior-reference-only",
+      "use": "Active/inactive shadow hierarchy and compact information density."
+    },
+    {
+      "id": "plasma-panel-colorizer",
+      "repository": "https://github.com/luisbocanegra/plasma-panel-colorizer",
+      "commit": "f144a27d4c339cf146fdad5ecacb26d36877e939",
+      "license": "GPL-3.0-only package; mixed file-level helper licenses",
+      "decision": "future-separate-gpl-extra",
+      "use": "Panel and per-widget surface engine with an independently authored MIT preset."
+    },
+    {
+      "id": "catppuccin-kde",
+      "repository": "https://github.com/catppuccin/kde",
+      "commit": "6606b5179cfc1e9ba5c3b6b70e15c468e2dddca2",
+      "license": "MIT",
+      "decision": "pipeline-reference",
+      "use": "Deterministic generated-output and palette pipeline patterns, not its visual identity."
+    },
+    {
+      "id": "kstats",
+      "repository": "https://github.com/oowl/kstats",
+      "commit": "0b07cab9835c6ce84e13e57f8e188854846b4318",
+      "license": "MIT",
+      "decision": "future-file-level-audit",
+      "use": "KSysGuard sensor-only interaction and bounded history; exclude shell collectors."
+    },
+    {
+      "id": "window-title-reborn",
+      "repository": "https://github.com/ShrekBytes/window-title-reborn",
+      "commit": "6401e8567f059ecc765d7d78442b4fc262256cb2",
+      "license": "GPL-3.0-or-later",
+      "decision": "independent-reimplementation",
+      "use": "Template, width, icon, maximized-only, wheel, and click behavior."
+    },
+    {
+      "id": "resources-monitor",
+      "repository": "https://github.com/orblazer/plasma-applet-resources-monitor",
+      "commit": "785f51841948e4bc65ae743390ca9b6309339f98",
+      "license": "GPL-3.0-or-later",
+      "decision": "independent-reimplementation",
+      "use": "Metric order, visibility, update rate, and threshold behavior."
+    },
+    {
+      "id": "media-player-improved",
+      "repository": "https://github.com/Qehbr/MediaPlayerImproved",
+      "commit": "95e7271caa327d9d91ce3204dcdfeb524175f549",
+      "license": "GPL-2.0-or-later package with GPL/LGPL file-level SPDX",
+      "decision": "future-separate-gpl-extra",
+      "use": "Conditional MPRIS media section; real-audio shell visualizer remains disabled."
+    },
+    {
+      "id": "polonium",
+      "repository": "https://github.com/zeroxoneafour/polonium",
+      "commit": "afc713f6fa12eac5d4149ee565b616ddd60cf741",
+      "license": "MIT",
+      "decision": "future-isolated-module",
+      "use": "Optional Plasma 6 tiling engine, independent from panel rendering."
+    },
+    {
+      "id": "special-workspace",
+      "repository": "https://github.com/Qehbr/kde-special-workspace",
+      "commit": "cb8b87888f1d552d95a24b0f0694788c3999203d",
+      "license": "GPL-2.0-or-later",
+      "decision": "future-separate-gpl-extra",
+      "use": "Optional scratchpad roles, excluded from Polonium tiling rules."
+    },
+    {
+      "id": "html-clock-plasmoid",
+      "repository": "https://github.com/MarcinOrlowski/html-clock-plasmoid",
+      "commit": "1623993a78999f0ec37e9dc9812186b4857bc4e9",
+      "license": "NOASSERTION: repository-level license file absent at reviewed commit",
+      "decision": "do-not-copy",
+      "use": "Only independently specified safe placeholders and layouts may be implemented."
+    }
+  ]
+}

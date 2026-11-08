@@ -15,8 +15,7 @@ fail() {
 metadata_files=()
 for metadata_root in \
     "$REPO_ROOT/layouts/plasma" \
-    "$REPO_ROOT/plasmoids" \
-    "$REPO_ROOT/packages/store"; do
+    "$REPO_ROOT/plasmoids"; do
     [[ -d $metadata_root ]] || continue
     while IFS= read -r -d '' metadata_file; do
         metadata_files+=("$metadata_file")

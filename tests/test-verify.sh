@@ -32,6 +32,89 @@ mkdir -p -- "$TARGET_HOME/.config" "$MOCK_BIN" "$RECEIPT"
 touch "$TARGET_HOME/.config/kdeglobals" "$TARGET_HOME/.config/konsolerc" \
     "$TARGET_HOME/.config/plasmarc" "$TARGET_HOME/.config/kwinrc"
 
+PANEL_CONFIG="$TARGET_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+: > "$PANEL_CONFIG"
+append_panel_fixture() {
+    local panel_id=$1 order=$2 entry id plugin
+    shift 2
+
+    printf '[Containments][%s]\nplugin=org.kde.plasma.panel\n\n' "$panel_id" \
+        >> "$PANEL_CONFIG"
+    for entry in "$@"; do
+        id=${entry%%=*}
+        plugin=${entry#*=}
+        printf '[Containments][%s][Applets][%s]\nplugin=%s\n\n' \
+            "$panel_id" "$id" "$plugin" >> "$PANEL_CONFIG"
+    done
+    printf '[Containments][%s][General]\nAppletOrder=%s\n\n' \
+        "$panel_id" "$order" >> "$PANEL_CONFIG"
+}
+
+append_panel_fixture 102 '201;202;203;204;205;206;207' \
+    201=org.kde.plasma.kickoff \
+    202=org.kde.minimalist.activewindowtitle \
+    203=org.kde.plasma.panelspacer \
+    204=org.kde.plasma.marginsseparator \
+    205=org.kde.plasma.kimpanel \
+    206=org.kde.plasma.systemtray \
+    207=org.kde.plasma.digitalclock
+append_panel_fixture 103 '301;302;303;304;305;306;307;308' \
+    301=org.kde.plasma.kickoff \
+    302=org.kde.minimalist.activewindowtitle \
+    303=org.kde.plasma.panelspacer \
+    304=org.kde.minimalist.resources \
+    305=org.kde.plasma.marginsseparator \
+    306=org.kde.plasma.kimpanel \
+    307=org.kde.plasma.systemtray \
+    308=org.kde.plasma.digitalclock
+append_panel_fixture 104 '401;402;403;404;405;406;407;408;409;410' \
+    401=org.kde.plasma.kickoff \
+    402=org.kde.minimalist.activewindowtitle \
+    403=org.kde.plasma.panelspacer \
+    404=org.kde.plasma.icontasks \
+    405=org.kde.plasma.panelspacer \
+    406=org.kde.minimalist.resources \
+    407=org.kde.plasma.marginsseparator \
+    408=org.kde.plasma.kimpanel \
+    409=org.kde.plasma.systemtray \
+    410=org.kde.plasma.digitalclock
+append_panel_fixture 105 '501;502;503;504;505;506;507;508;509;510;511' \
+    501=org.kde.plasma.kickoff \
+    502=org.kde.plasma.pager \
+    503=org.kde.minimalist.activewindowtitle \
+    504=org.kde.plasma.panelspacer \
+    505=org.kde.plasma.icontasks \
+    506=org.kde.plasma.panelspacer \
+    507=org.kde.minimalist.resources \
+    508=org.kde.plasma.marginsseparator \
+    509=org.kde.plasma.kimpanel \
+    510=org.kde.plasma.systemtray \
+    511=org.kde.plasma.digitalclock
+append_panel_fixture 106 '601;602;603;604;605;606;607;608;609;610;611' \
+    601=org.kde.plasma.kickoff \
+    602=org.kde.minimalist.workspaces \
+    603=org.kde.minimalist.activewindowtitle \
+    604=org.kde.plasma.panelspacer \
+    605=org.kde.plasma.icontasks \
+    606=org.kde.plasma.panelspacer \
+    607=org.kde.minimalist.resources \
+    608=org.kde.plasma.marginsseparator \
+    609=org.kde.plasma.kimpanel \
+    610=org.kde.plasma.systemtray \
+    611=org.kde.plasma.digitalclock
+
+# Neither a nested system-tray applet nor a config-only orphan is a direct
+# panel applet with a plugin key.
+printf '%s\n' \
+    '[Containments][104][Applets][409][Applets][490]' \
+    'plugin=org.kde.plasma.notifications' \
+    '' \
+    '[Containments][104][Applets][499][Configuration][General]' \
+    'fixtureValue=true' \
+    >> "$PANEL_CONFIG"
+PANEL_CONFIG_BASELINE="$TEMP_ROOT/panel-config.baseline"
+cp -- "$PANEL_CONFIG" "$PANEL_CONFIG_BASELINE"
+
 bash -n "$VERIFY"
 bash -n "$REPO_ROOT/scripts/lib/display-state.sh"
 if grep -Eq 'kwriteconfig|plasma-apply|applywindowdecoration|new[[:space:]]+Panel|addWidget|\.remove\(' "$VERIFY" \
@@ -64,7 +147,7 @@ if [[ ${MOCK_IMPLICIT_BREEZE:-0} == 1 ]]; then
 fi
 case "$group:$key" in
     General:ColorScheme) printf '%s\n' "${MOCK_COLOR:-BlackMinimal}" ;;
-    'Colors:Selection:BackgroundNormal') printf '%s\n' "${MOCK_SELECTION:-145,70,255}" ;;
+    'Colors:Selection:BackgroundNormal') printf '%s\n' "${MOCK_SELECTION:-0,122,204}" ;;
     'Desktop Entry:DefaultProfile') printf '%s\n' "${MOCK_PROFILE:-BlackMinimal.profile}" ;;
     'Theme:name') printf '%s\n' "${MOCK_PLASMA_THEME:-default}" ;;
     'org.kde.kdecoration2:library') printf '%s\n' "${MOCK_DECORATION_LIBRARY:-org.kde.breeze}" ;;
@@ -129,6 +212,28 @@ if [[ $script == *KDE_RICE_PANEL_STATE_JSON* ]]; then
             "$geometry_ok" "$spacer_ok" "$title_ok" "$tray_ok" "$clock_ok" \
             "$no_duplicates" "$known" "$builtins"
     fi
+    if [[ ${MOCK_PANEL_MISMATCH:-0} == 1 ]]; then
+        persistent_json='{"panels":[]}'
+    else
+        case "${MOCK_PANEL_SIGNATURE:-minimalist-v04}" in
+            minimalist-v02)
+                persistent_json='{"panels":[{"id":102,"applet_order":"201;202;203;204;205;206;207","widget_entries":[{"id":201,"type":"org.kde.plasma.kickoff"},{"id":202,"type":"org.kde.minimalist.activewindowtitle"},{"id":203,"type":"org.kde.plasma.panelspacer"},{"id":204,"type":"org.kde.plasma.marginsseparator"},{"id":205,"type":"org.kde.plasma.kimpanel"},{"id":206,"type":"org.kde.plasma.systemtray"},{"id":207,"type":"org.kde.plasma.digitalclock"}]}]}'
+                ;;
+            minimalist-v03)
+                persistent_json='{"panels":[{"id":103,"applet_order":"301;302;303;304;305;306;307;308","widget_entries":[{"id":301,"type":"org.kde.plasma.kickoff"},{"id":302,"type":"org.kde.minimalist.activewindowtitle"},{"id":303,"type":"org.kde.plasma.panelspacer"},{"id":304,"type":"org.kde.minimalist.resources"},{"id":305,"type":"org.kde.plasma.marginsseparator"},{"id":306,"type":"org.kde.plasma.kimpanel"},{"id":307,"type":"org.kde.plasma.systemtray"},{"id":308,"type":"org.kde.plasma.digitalclock"}]}]}'
+                ;;
+            minimalist-v04-pager)
+                persistent_json='{"panels":[{"id":105,"applet_order":"501;502;503;504;505;506;507;508;509;510;511","widget_entries":[{"id":501,"type":"org.kde.plasma.kickoff"},{"id":502,"type":"org.kde.plasma.pager"},{"id":503,"type":"org.kde.minimalist.activewindowtitle"},{"id":504,"type":"org.kde.plasma.panelspacer"},{"id":505,"type":"org.kde.plasma.icontasks"},{"id":506,"type":"org.kde.plasma.panelspacer"},{"id":507,"type":"org.kde.minimalist.resources"},{"id":508,"type":"org.kde.plasma.marginsseparator"},{"id":509,"type":"org.kde.plasma.kimpanel"},{"id":510,"type":"org.kde.plasma.systemtray"},{"id":511,"type":"org.kde.plasma.digitalclock"}]}]}'
+                ;;
+            minimalist-v04-workspaces)
+                persistent_json='{"panels":[{"id":106,"applet_order":"601;602;603;604;605;606;607;608;609;610;611","widget_entries":[{"id":601,"type":"org.kde.plasma.kickoff"},{"id":602,"type":"org.kde.minimalist.workspaces"},{"id":603,"type":"org.kde.minimalist.activewindowtitle"},{"id":604,"type":"org.kde.plasma.panelspacer"},{"id":605,"type":"org.kde.plasma.icontasks"},{"id":606,"type":"org.kde.plasma.panelspacer"},{"id":607,"type":"org.kde.minimalist.resources"},{"id":608,"type":"org.kde.plasma.marginsseparator"},{"id":609,"type":"org.kde.plasma.kimpanel"},{"id":610,"type":"org.kde.plasma.systemtray"},{"id":611,"type":"org.kde.plasma.digitalclock"}]}]}'
+                ;;
+            *)
+                persistent_json='{"panels":[{"id":104,"applet_order":"401;402;403;404;405;406;407;408;409;410","widget_entries":[{"id":401,"type":"org.kde.plasma.kickoff"},{"id":402,"type":"org.kde.minimalist.activewindowtitle"},{"id":403,"type":"org.kde.plasma.panelspacer"},{"id":404,"type":"org.kde.plasma.icontasks"},{"id":405,"type":"org.kde.plasma.panelspacer"},{"id":406,"type":"org.kde.minimalist.resources"},{"id":407,"type":"org.kde.plasma.marginsseparator"},{"id":408,"type":"org.kde.plasma.kimpanel"},{"id":409,"type":"org.kde.plasma.systemtray"},{"id":410,"type":"org.kde.plasma.digitalclock"}]}]}'
+                ;;
+        esac
+    fi
+    printf 'KDE_RICE_PANEL_STATE_JSON=%s\n' "$persistent_json"
 else
     exit 9
 fi
@@ -144,7 +249,7 @@ cat > "$MOCK_BIN/busctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${!#}" in
-    count) printf '%s\n' '{"type":"u","data":4}' ;;
+    count) printf '{"type":"u","data":%s}\n' "${MOCK_DESKTOP_COUNT:-4}" ;;
     rows) printf '%s\n' '{"type":"u","data":1}' ;;
     *) exit 2 ;;
 esac
@@ -200,7 +305,7 @@ PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 KDE_RICE_DBUS_TO
     MOCK_PANEL_SIGNATURE=minimalist-v03 \
     "$VERIFY" --receipt "$RECEIPT" --panel-target minimalist-v03 --json \
     > "$TEMP_ROOT/verified-v03.json"
-"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); for(const n of ["panel_topology","resource_policy","resource_plasmoid"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); for(const n of ["panel_topology","persistent_panel_topology","resource_policy","resource_plasmoid"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
     "$TEMP_ROOT/verified-v03.json" || fail "v0.3 verification omitted its resource checks"
 
 cp -a -- "$REPO_ROOT/layouts/plasma/org.kde.minimalist-v04" \
@@ -211,8 +316,57 @@ cp -- "$REPO_ROOT/config/fastfetch/config.jsonc" \
 printf 'minimalist-v04\n' > "$RECEIPT/panel-target"
 PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" \
     "$VERIFY" --receipt "$RECEIPT" --json > "$TEMP_ROOT/verified-v04.json"
-"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); for(const n of ["panel_topology","flexible_spacers","resource_policy","task_manager_policy","resource_plasmoid","layout_template","fastfetch_config","fastfetch_render","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); for(const n of ["panel_topology","persistent_panel_topology","flexible_spacers","resource_policy","task_manager_policy","resource_plasmoid","layout_template","fastfetch_config","fastfetch_render","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
     "$TEMP_ROOT/verified-v04.json" || fail "v0.4.1 verification omitted its centered task checks"
+
+# The successful fixture above proves that nested system-tray children and a
+# config-only orphan do not count as direct panel applets. A stale direct
+# plugin group must fail even when the live AppletOrder itself is healthy.
+printf '%s\n' \
+    '[Containments][104][Applets][498]' \
+    'plugin=org.kde.minimalist.resources' \
+    >> "$PANEL_CONFIG"
+set +e
+PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
+    KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" \
+    "$VERIFY" --receipt "$RECEIPT" --json > "$TEMP_ROOT/persistent-extra-group.json"
+status=$?
+set -e
+[[ $status == 1 ]] || fail "stale direct panel plugin group did not exit 1"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const c=v.checks.find(c=>c.name==="persistent_panel_topology");if(!c||c.ok||!c.actual.includes("disk-extra-or-duplicate-direct-plugin"))process.exit(1)' \
+    "$TEMP_ROOT/persistent-extra-group.json" \
+    || fail "stale direct panel plugin group was not reported"
+cp -- "$PANEL_CONFIG_BASELINE" "$PANEL_CONFIG"
+
+sed -i \
+    's/^AppletOrder=401;402;403;404;405;406;407;408;409;410$/AppletOrder=402;401;403;404;405;406;407;408;409;410/' \
+    "$PANEL_CONFIG"
+set +e
+PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
+    KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" \
+    "$VERIFY" --receipt "$RECEIPT" --json > "$TEMP_ROOT/persistent-order-mismatch.json"
+status=$?
+set -e
+[[ $status == 1 ]] || fail "persistent AppletOrder mismatch did not exit 1"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const c=v.checks.find(c=>c.name==="persistent_panel_topology");if(!c||c.ok||!c.actual.includes("live=104:401;402")||!c.actual.includes("disk=104:402;401"))process.exit(1)' \
+    "$TEMP_ROOT/persistent-order-mismatch.json" \
+    || fail "persistent AppletOrder mismatch was not reported"
+cp -- "$PANEL_CONFIG_BASELINE" "$PANEL_CONFIG"
+
+sed -i \
+    '/^\[Containments\]\[104\]\[Applets\]\[402\]$/,/^\[/ s/^plugin=org.kde.minimalist.activewindowtitle$/plugin=org.example.wrong/' \
+    "$PANEL_CONFIG"
+set +e
+PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
+    KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" \
+    "$VERIFY" --receipt "$RECEIPT" --json > "$TEMP_ROOT/persistent-plugin-mismatch.json"
+status=$?
+set -e
+[[ $status == 1 ]] || fail "persistent panel plugin mismatch did not exit 1"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const c=v.checks.find(c=>c.name==="persistent_panel_topology");if(!c||c.ok||!c.actual.includes("402=org.kde.minimalist.activewindowtitle")||!c.actual.includes("402=org.example.wrong"))process.exit(1)' \
+    "$TEMP_ROOT/persistent-plugin-mismatch.json" \
+    || fail "persistent panel plugin mismatch was not reported"
+cp -- "$PANEL_CONFIG_BASELINE" "$PANEL_CONFIG"
 
 printf 'minimalist-v04-pager\n' > "$RECEIPT/panel-target"
 PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
@@ -220,7 +374,7 @@ PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
     MOCK_PANEL_SIGNATURE=minimalist-v04-pager \
     "$VERIFY" --receipt "$RECEIPT" --panel-target minimalist-v04-pager --json \
     > "$TEMP_ROOT/verified-pager.json"
-"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const n of ["panel_topology","pager_policy","virtual_desktop_count","virtual_desktop_rows","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const n of ["panel_topology","persistent_panel_topology","pager_policy","virtual_desktop_count","virtual_desktop_rows","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
     "$TEMP_ROOT/verified-pager.json" || fail "Pager verification omitted its panel or KWin checks"
 
 cp -a -- "$REPO_ROOT/plasmoids/org.kde.minimalist.workspaces" \
@@ -231,9 +385,46 @@ PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
     MOCK_PANEL_SIGNATURE=minimalist-v04-workspaces \
     "$VERIFY" --receipt "$RECEIPT" --panel-target minimalist-v04-workspaces --json \
     > "$TEMP_ROOT/verified-workspaces.json"
-"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const n of ["panel_topology","workspace_switcher_policy","workspace_plasmoid","virtual_desktop_count","virtual_desktop_rows","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const n of ["panel_topology","persistent_panel_topology","workspace_switcher_policy","workspace_plasmoid","virtual_desktop_count","virtual_desktop_rows","receipt_panel_target"]){const c=v.checks.find(c=>c.name===n);if(!c||!c.ok)process.exit(1)}' \
     "$TEMP_ROOT/verified-workspaces.json" \
     || fail "Workspaces verification omitted its package, panel, or KWin checks"
+
+# A reviewed count is an exact expectation, never a request to change KWin.
+for expected in 3 4 5; do
+    set +e
+    PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 \
+        KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" KDE_RICE_KWIN_BUSCTL="$MOCK_BIN/busctl" \
+        MOCK_PANEL_SIGNATURE=minimalist-v04-workspaces MOCK_DESKTOP_COUNT=3 \
+        "$VERIFY" --receipt "$RECEIPT" --panel-target minimalist-v04-workspaces \
+        --expected-desktops "$expected" --json > "$TEMP_ROOT/desktop-count-$expected.json"
+    status=$?
+    set -e
+    if [[ $expected == 3 ]]; then
+        [[ $status == 0 ]] || fail "explicit three-desktop expectation failed"
+    else
+        [[ $status == 1 ]] || fail "incorrect desktop expectation passed"
+    fi
+    "$NODE_BIN" - "$TEMP_ROOT/desktop-count-$expected.json" "$expected" <<'NODE'
+const v = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+const expected = process.argv[3];
+const c = v.checks.find(c => c.name === "virtual_desktop_count");
+if (!c || c.expected !== expected || c.actual !== "3" || c.ok !== (expected === "3")) process.exit(1);
+NODE
+done
+for invalid in 0 -1 3.5 03 bad; do
+    set +e
+    "$VERIFY" --panel-target minimalist-v04-workspaces --expected-desktops "$invalid" \
+        > "$TEMP_ROOT/invalid-count.txt" 2>&1
+    status=$?
+    set -e
+    [[ $status == 64 ]] || fail "invalid desktop count was accepted: $invalid"
+done
+set +e
+"$VERIFY" --panel-target minimalist-v04-workspaces --resume-receipt "$RECEIPT" \
+    --expected-desktops 3 > "$TEMP_ROOT/resume-count.txt" 2>&1
+status=$?
+set -e
+[[ $status == 64 ]] || fail "custom count changed the resume recovery contract"
 printf 'minimalist-v04\n' > "$RECEIPT/panel-target"
 
 printf '\n// tampered\n' >> "$TARGET_HOME/.config/fastfetch/config.jsonc"
@@ -337,6 +528,15 @@ set -e
 [[ $status == 1 ]] || fail "target mismatch exit code is not 1"
 "$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(v.status!=="mismatch"||!v.checks.some(c=>c.name==="color_scheme"&&!c.ok))process.exit(1)' \
     "$TEMP_ROOT/mismatch.json" || fail "mismatch JSON omitted the failed color check"
+
+set +e
+PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" \
+    MOCK_SELECTION=145,70,255 "$VERIFY" --receipt "$RECEIPT" --json > "$TEMP_ROOT/previous-purple.json"
+status=$?
+set -e
+[[ $status == 1 ]] || fail "previous purple accent passed the blue contract"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const c=v.checks.find(c=>c.name==="selection_color");if(!c||c.ok||c.expected!=="0,122,204"||c.actual!=="145,70,255")process.exit(1)' \
+    "$TEMP_ROOT/previous-purple.json" || fail "previous accent mismatch lacks exact color evidence"
 
 set +e
 PATH="$MOCK_BIN:$PATH" HOME="$TARGET_HOME" KDE_RICE_TEST_MODE=1 KDE_RICE_DBUS_TOOL="$MOCK_BIN/qdbus6" MOCK_WIDGETS_KNOWN=false \
@@ -450,6 +650,10 @@ set -e
 [[ $status == 1 ]] || fail "changed kscreen directory fingerprint did not exit 1"
 "$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const c=v.checks.find(c=>c.name==="display_configuration_unchanged");if(!c||c.ok||!c.actual.includes("differs"))process.exit(1)' \
     "$TEMP_ROOT/kscreen-directory-mismatch.json" || fail "changed kscreen directory was not reported"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(v.status!=="mismatch"||v.summary.managed_state!=="verified"||v.summary.display_state!=="changed_since_receipt")process.exit(1)' \
+    "$TEMP_ROOT/kscreen-directory-mismatch.json" || fail "display drift was not separated from managed-state verification"
+"$NODE_BIN" -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(v.summary.display_state!=="changed_during_apply")process.exit(1)' \
+    "$TEMP_ROOT/bootstrap-display-mismatch.json" || fail "apply-time display mutation lost its classification"
 rm -rf -- "$TARGET_HOME/.local/share/kscreen"
 printf '%s\n' \
     $'.config/kwinoutputconfig.json\tabsent' \

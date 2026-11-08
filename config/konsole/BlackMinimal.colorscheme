@@ -91,6 +91,7 @@ Color=255,255,255
 [General]
 Blur=false
 ColorRandomization=false
-Description=Black Minimal
+Description=Minimalist Black
+Description[ko]=미니멀리스트 블랙
 Opacity=1
 Wallpaper=

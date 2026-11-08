@@ -1,62 +1,114 @@
 // Minimalist v0.4.1 phase two: add one compact native task surface only after
 // the second spacer has settled in Plasma's live panel layout.
 
+// BEGIN GENERATED PANEL CONSTANTS
 const spacerType = "org.kde.plasma.panelspacer";
 const taskType = "org.kde.plasma.icontasks";
 const resourceType = "org.kde.minimalist.resources";
 const clockType = "org.kde.plasma.digitalclock";
 const pagerType = "org.kde.plasma.pager";
 const workspaceType = "org.kde.minimalist.workspaces";
-const resourceRevision = 2;
 const stagedWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const stagedWidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "rightSpacer": 3,
+    "resources": 4,
+    "margin": 5,
+    "input": 6,
+    "tray": 7,
+    "clock": 8
+};
 const targetWidgets = [
     "org.kde.plasma.kickoff",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const targetWidgetsPositions = {
+    "launcher": 0,
+    "title": 1,
+    "leftSpacer": 2,
+    "tasks": 3,
+    "rightSpacer": 4,
+    "resources": 5,
+    "margin": 6,
+    "input": 7,
+    "tray": 8,
+    "clock": 9
+};
 const pagerTargetWidgets = [
     "org.kde.plasma.kickoff",
-    pagerType,
+    "org.kde.plasma.pager",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const pagerTargetWidgetsPositions = {
+    "launcher": 0,
+    "pager": 1,
+    "title": 2,
+    "leftSpacer": 3,
+    "tasks": 4,
+    "rightSpacer": 5,
+    "resources": 6,
+    "margin": 7,
+    "input": 8,
+    "tray": 9,
+    "clock": 10
+};
 const workspacesTargetWidgets = [
     "org.kde.plasma.kickoff",
-    workspaceType,
+    "org.kde.minimalist.workspaces",
     "org.kde.minimalist.activewindowtitle",
-    spacerType,
-    taskType,
-    spacerType,
-    resourceType,
+    "org.kde.plasma.panelspacer",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.panelspacer",
+    "org.kde.minimalist.resources",
     "org.kde.plasma.marginsseparator",
     "org.kde.plasma.kimpanel",
     "org.kde.plasma.systemtray",
     "org.kde.plasma.digitalclock"
 ];
+const workspacesTargetWidgetsPositions = {
+    "launcher": 0,
+    "workspaces": 1,
+    "title": 2,
+    "leftSpacer": 3,
+    "tasks": 4,
+    "rightSpacer": 5,
+    "resources": 6,
+    "margin": 7,
+    "input": 8,
+    "tray": 9,
+    "clock": 10
+};
+// END GENERATED PANEL CONSTANTS
+const resourceRevision = 2;
+
 
 function sameSequence(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
@@ -207,9 +259,9 @@ if (!clock) {
 
 if (sameSequence(before.types, stagedWidgets)) {
     transition = "complete-v04-staged";
-    leftSpacer = before.widgets[2];
-    rightSpacer = before.widgets[3];
-    resource = before.widgets[4];
+    leftSpacer = before.widgets[stagedWidgetsPositions.leftSpacer];
+    rightSpacer = before.widgets[stagedWidgetsPositions.rightSpacer];
+    resource = before.widgets[stagedWidgetsPositions.resources];
     if (!validSettledAnchor(rightSpacer)) {
         throw new Error("the staged right-spacer placement anchor has not settled");
     }
@@ -225,24 +277,24 @@ if (sameSequence(before.types, stagedWidgets)) {
     }
     addedTasks = true;
 } else if (sameSequence(before.types, targetWidgets)) {
-    leftSpacer = before.widgets[2];
-    tasks = before.widgets[3];
-    rightSpacer = before.widgets[4];
-    resource = before.widgets[5];
+    leftSpacer = before.widgets[targetWidgetsPositions.leftSpacer];
+    tasks = before.widgets[targetWidgetsPositions.tasks];
+    rightSpacer = before.widgets[targetWidgetsPositions.rightSpacer];
+    resource = before.widgets[targetWidgetsPositions.resources];
 } else if (sameSequence(before.types, pagerTargetWidgets)) {
     transition = "already-pager-target";
-    optionalWidget = before.widgets[1];
-    leftSpacer = before.widgets[3];
-    tasks = before.widgets[4];
-    rightSpacer = before.widgets[5];
-    resource = before.widgets[6];
+    optionalWidget = before.widgets[pagerTargetWidgetsPositions.pager];
+    leftSpacer = before.widgets[pagerTargetWidgetsPositions.leftSpacer];
+    tasks = before.widgets[pagerTargetWidgetsPositions.tasks];
+    rightSpacer = before.widgets[pagerTargetWidgetsPositions.rightSpacer];
+    resource = before.widgets[pagerTargetWidgetsPositions.resources];
 } else if (sameSequence(before.types, workspacesTargetWidgets)) {
     transition = "already-workspaces-target";
-    optionalWidget = before.widgets[1];
-    leftSpacer = before.widgets[3];
-    tasks = before.widgets[4];
-    rightSpacer = before.widgets[5];
-    resource = before.widgets[6];
+    optionalWidget = before.widgets[workspacesTargetWidgetsPositions.workspaces];
+    leftSpacer = before.widgets[workspacesTargetWidgetsPositions.leftSpacer];
+    tasks = before.widgets[workspacesTargetWidgetsPositions.tasks];
+    rightSpacer = before.widgets[workspacesTargetWidgetsPositions.rightSpacer];
+    resource = before.widgets[workspacesTargetWidgetsPositions.resources];
 } else {
     throw new Error(
         "panel topology differs from the exact settled-v0.4.1-stage/v0.4.1 states: "

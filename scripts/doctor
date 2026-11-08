@@ -409,6 +409,7 @@ else
     add_check dbus_tool unsupported true "qdbus6 or a compatible D-Bus tool was not found"
 fi
 
+check_command flock flock
 check_command kwriteconfig6 kwriteconfig6
 check_command kreadconfig6 kreadconfig6
 check_command plasma_apply_colorscheme plasma-apply-colorscheme
@@ -573,6 +574,9 @@ if $panel_ok; then
             && -f $v04_layout/contents/workspaces-layout.js \
             && -f $v04_layout/contents/workspaces-postcheck.js \
             && -f $v04_layout/contents/workspaces-cleanup.js \
+            && -f $v04_layout/contents/duplicate-tail-preflight.js \
+            && -f $v04_layout/contents/duplicate-tail-cleanup.js \
+            && -f $v04_layout/contents/duplicate-tail-postcheck.js \
             && -d $workspace_plasmoid \
             && -f $workspace_plasmoid/metadata.json \
             && -f $workspace_plasmoid/contents/ui/main.qml ]] || v04_source_ok=false
@@ -617,6 +621,10 @@ if $panel_ok; then
             "panel opacity transition safety could not be determined"
     else
         case "$panel_signature" in
+            minimalist-v04-workspaces-duplicate-tail)
+                add_check panels degraded true \
+                    "count=$panel_count topology=$panel_signature transition=$panel_transition; exact receipt-bound stale-tail recovery is required"
+                ;;
             plasma6-stock | plasma6-stock-ime | minimalist-v01 \
                 | minimalist-v02-show-desktop | minimalist-v02-no-title \
                 | minimalist-v02-spacer-repair | minimalist-v02-title-repair \
@@ -643,7 +651,8 @@ if $panel_ok; then
                 | minimalist-v02-spacer-repair | minimalist-v02-title-repair \
                 | minimalist-v02 | minimalist-v03 | minimalist-v04-spacer-staged \
                 | minimalist-v04-task-front-staged \
-                | minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces)
+                | minimalist-v04 | minimalist-v04-pager | minimalist-v04-workspaces \
+                | minimalist-v04-workspaces-duplicate-tail)
                 if [[ $panel_geometry == *,opaque,* ]]; then
                     add_check panel_opacity_transition supported false \
                         "recognized managed panel already reports Opaque"

@@ -10,6 +10,7 @@ MANIFEST="$REPO_ROOT/config/managed-paths.txt"
 TARGET_HOME=${HOME:-}
 APPLY=false
 INSTALL_ONLY=false
+COLORS_ONLY=false
 
 ASSET_SOURCES=(
     "config/color-schemes/BlackMinimal.colors"
@@ -27,7 +28,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/apply-black [OPTIONS]
 
-Preview or apply the Black Minimal KDE application palette and Konsole profile.
+Preview or apply the Minimalist Black KDE application palette and Konsole profile.
 Preview is the default. The active wallpaper, Plasma Style, KWin decoration,
 panel composition, tiling, and display configuration are preserved.
 
@@ -36,6 +37,8 @@ Options:
   --apply               Capture a baseline, install, and activate the assets
   --dry-run             Explicitly select preview mode (default)
   --install-only        Install assets without changing the live KDE session
+  --colors-only         Install/activate only KDE colors; preserve Konsole assets
+                        and its default-profile configuration
   -h, --help            Show this help
 
 Live activation is allowed only for the current user's home. Existing Plasma
@@ -62,6 +65,10 @@ while (($#)); do
             INSTALL_ONLY=true
             shift
             ;;
+        --colors-only)
+            COLORS_ONLY=true
+            shift
+            ;;
         --help | -h)
             usage
             exit 0
@@ -72,6 +79,11 @@ while (($#)); do
     esac
 done
 
+if $COLORS_ONLY; then
+    ASSET_SOURCES=("${ASSET_SOURCES[0]}")
+    ASSET_TARGETS=("${ASSET_TARGETS[0]}")
+fi
+
 require_command realpath
 require_command cp
 require_command date
@@ -79,6 +91,10 @@ require_command mv
 refuse_root
 
 TARGET_HOME=$(normalize_existing_directory "$TARGET_HOME" "target home")
+require_canonical_xdg_roots "$TARGET_HOME"
+if $APPLY; then
+    acquire_managed_lock "$TARGET_HOME"
+fi
 load_managed_paths "$MANIFEST"
 
 declare -A managed=()
@@ -91,9 +107,9 @@ for index in "${!ASSET_SOURCES[@]}"; do
     target_relative=${ASSET_TARGETS[$index]}
     source_path="$REPO_ROOT/$source_relative"
 
-    validate_relative_path "$target_relative" || die "unsafe Black Minimal target: $target_relative"
-    [[ -n ${managed[$target_relative]+x} ]] || die "Black Minimal target is not managed: $target_relative"
-    [[ -f $source_path && ! -L $source_path ]] || die "Black Minimal source is missing or unsafe: $source_relative"
+    validate_relative_path "$target_relative" || die "unsafe Minimalist Black target: $target_relative"
+    [[ -n ${managed[$target_relative]+x} ]] || die "Minimalist Black target is not managed: $target_relative"
+    [[ -f $source_path && ! -L $source_path ]] || die "Minimalist Black source is missing or unsafe: $source_relative"
     assert_parent_within_home "$TARGET_HOME" "$target_relative"
 done
 
@@ -104,17 +120,25 @@ if ! $INSTALL_ONLY; then
     require_command kreadconfig6
 fi
 
-printf 'Black Minimal mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
+printf 'Minimalist Black mode: %s\n' "$($APPLY && printf 'APPLY' || printf 'DRY RUN')"
 printf 'Target home: %s\n' "$TARGET_HOME"
-printf 'Activation: %s\n\n' "$($INSTALL_ONLY && printf 'install only' || printf 'KDE colors + Konsole profile')"
+if $INSTALL_ONLY; then
+    printf 'Activation: install only\n\n'
+elif $COLORS_ONLY; then
+    printf 'Activation: KDE colors only\n\n'
+else
+    printf 'Activation: KDE colors + Konsole profile\n\n'
+fi
 
 for index in "${!ASSET_SOURCES[@]}"; do
     printf 'install %-45s -> %s\n' "${ASSET_SOURCES[$index]}" "${ASSET_TARGETS[$index]}"
 done
 
 if ! $INSTALL_ONLY; then
-    printf '\nactivate KDE color scheme: BlackMinimal (vivid-purple focus #9146FF)\n'
-    printf 'set Konsole default profile: BlackMinimal.profile\n'
+    printf '\nactivate KDE color scheme: BlackMinimal (blue focus #007ACC)\n'
+    if ! $COLORS_ONLY; then
+        printf 'set Konsole default profile: BlackMinimal.profile\n'
+    fi
     printf 'preserve current wallpaper and shell composition exactly as-is\n'
 fi
 
@@ -133,7 +157,7 @@ capture_or_reuse_snapshot "$TARGET_HOME" "$snapshot_path" "$SCRIPT_DIR/snapshot"
 
 apply_error() {
     local status=$?
-    warn "Black Minimal apply stopped after an error; no desktop restart was attempted"
+    warn "Minimalist Black apply stopped after an error; no desktop restart was attempted"
     warn "rollback preview: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME"
     warn "rollback apply: $SCRIPT_DIR/restore --backup $snapshot_path --home $TARGET_HOME --apply"
     exit "$status"
@@ -149,7 +173,7 @@ for index in "${!ASSET_SOURCES[@]}"; do
     temporary="$destination.kde-rice-new-$$"
     current=$(path_type "$destination")
 
-    [[ $current != unsupported ]] || die "Black Minimal target has an unsupported type: $target_relative"
+    [[ $current != unsupported ]] || die "Minimalist Black target has an unsupported type: $target_relative"
     [[ ! -e $temporary && ! -L $temporary ]] || die "temporary install path already exists: $temporary"
     mkdir -p -- "$(dirname -- "$destination")"
     cp -a -- "$source_path" "$temporary"
@@ -161,23 +185,28 @@ for index in "${!ASSET_SOURCES[@]}"; do
 done
 
 if ! $INSTALL_ONLY; then
-    printf '\nActivating Black Minimal visual layer...\n'
+    printf '\nActivating Minimalist Black visual layer...\n'
     plasma-apply-colorscheme BlackMinimal
-    plasma-apply-colorscheme --accent-color '#9146FF'
-    kwriteconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key BackgroundNormal "145,70,255"
-    kwriteconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key BackgroundAlternate "119,44,232"
-    kwriteconfig6 --file "$TARGET_HOME/.config/konsolerc" --group "Desktop Entry" --key DefaultProfile "BlackMinimal.profile"
+    plasma-apply-colorscheme --accent-color '#007ACC'
+    kwriteconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key BackgroundNormal "0,122,204"
+    kwriteconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key BackgroundAlternate "0,100,167"
+    kwriteconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key ForegroundNormal "255,255,255" --notify
+    if ! $COLORS_ONLY; then
+        kwriteconfig6 --file "$TARGET_HOME/.config/konsolerc" --group "Desktop Entry" --key DefaultProfile "BlackMinimal.profile"
+    fi
 
     active_scheme=$(kreadconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group General --key ColorScheme)
     active_selection=$(kreadconfig6 --file "$TARGET_HOME/.config/kdeglobals" --group "Colors:Selection" --key BackgroundNormal)
-    active_profile=$(kreadconfig6 --file "$TARGET_HOME/.config/konsolerc" --group "Desktop Entry" --key DefaultProfile)
     [[ $active_scheme == BlackMinimal ]] || die "KDE did not record the BlackMinimal color scheme"
-    [[ $active_selection == 145,70,255 ]] || die "KDE did not record the vivid-purple selection color"
-    [[ $active_profile == BlackMinimal.profile ]] || die "Konsole did not record the BlackMinimal profile"
+    [[ $active_selection == 0,122,204 ]] || die "KDE did not record the blue selection color"
+    if ! $COLORS_ONLY; then
+        active_profile=$(kreadconfig6 --file "$TARGET_HOME/.config/konsolerc" --group "Desktop Entry" --key DefaultProfile)
+        [[ $active_profile == BlackMinimal.profile ]] || die "Konsole did not record the BlackMinimal profile"
+    fi
 fi
 
 trap - ERR
-printf '\nBlack Minimal apply complete.\n'
+printf '\nMinimalist Black apply complete.\n'
 printf 'Pre-apply snapshot: %s\n' "$snapshot_path"
 printf 'Restore preview: %s/restore --backup %s --home %s\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"
 printf 'Restore apply: %s/restore --backup %s --home %s --apply\n' "$SCRIPT_DIR" "$snapshot_path" "$TARGET_HOME"

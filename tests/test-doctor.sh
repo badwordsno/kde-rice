@@ -89,6 +89,7 @@ ln -s /usr/bin/realpath "$MOCK_BIN/realpath"
 ln -s /usr/bin/sed "$MOCK_BIN/sed"
 
 commands=(
+    flock
     qdbus6
     kwriteconfig6
     kreadconfig6
@@ -105,6 +106,7 @@ done
 
 target_widgets='org.kde.plasma.kickoff;org.kde.minimalist.activewindowtitle;org.kde.plasma.panelspacer;org.kde.plasma.marginsseparator;org.kde.plasma.kimpanel;org.kde.plasma.systemtray;org.kde.plasma.digitalclock'
 v04_widgets='org.kde.plasma.kickoff;org.kde.minimalist.activewindowtitle;org.kde.plasma.panelspacer;org.kde.plasma.icontasks;org.kde.plasma.panelspacer;org.kde.minimalist.resources;org.kde.plasma.marginsseparator;org.kde.plasma.kimpanel;org.kde.plasma.systemtray;org.kde.plasma.digitalclock'
+workspaces_widgets='org.kde.plasma.kickoff;org.kde.minimalist.workspaces;org.kde.minimalist.activewindowtitle;org.kde.plasma.panelspacer;org.kde.plasma.icontasks;org.kde.plasma.panelspacer;org.kde.minimalist.resources;org.kde.plasma.marginsseparator;org.kde.plasma.kimpanel;org.kde.plasma.systemtray;org.kde.plasma.digitalclock'
 supported_panel=$(printf '%s\n%s' \
     'KDE_RICE_PANEL_STATE_JSON={"schema_version":1,"panel_count":1,"signature":"minimalist-v04"}' \
     "KDE_RICE_PANEL_STATE schema=1 panelCount=1 desktopCount=1 signature=minimalist-v04 transition=v04-target supported=true targetComplete=true orderValid=true geometryOk=true spacerOk=true activeTitleOk=true resourceOk=true taskManagerOk=true trayOk=true clockOk=true noDuplicateTargetWidgets=true knownTargetWidgets=true knownBuiltInWidgets=true missingBuiltInWidgets=none iconTasksKnown=true activeTitleKnown=true spacerCount=2 spacerExpanding=true,true activeTitleRevision=1 resourceRevision=2 taskManagerFill=false taskManagerMaxStripes=1 taskManagerIconSpacing=0 widgetTypes=$v04_widgets geometry=0,top,horizontal,32,opaque,fill,1920,1920,1920 removePanelIds=none removeWidgetIds=none removeWidgetEntries=none createPanel=false targetWidgets=$target_widgets")
@@ -144,6 +146,13 @@ run_doctor() {
 
 TEST_QDBUS_RESULT="$concatenated_panel" run_doctor "$TEMP_ROOT/concatenated-panel.json" --json
 [[ $DOCTOR_STATUS == 0 ]] || fail "concatenated live probe output was not accepted"
+
+rm "$MOCK_BIN/flock"
+run_doctor "$TEMP_ROOT/missing-flock.json" --json
+[[ $DOCTOR_STATUS == 2 ]] || fail "missing operation lock tool was not refused"
+"$NODE_BIN" -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(r.checks.flock.status!=="unsupported"||!r.checks.flock.required)process.exit(1)' \
+    "$TEMP_ROOT/missing-flock.json" || fail "missing flock diagnosis is unclear"
+ln -s mock-command "$MOCK_BIN/flock"
 
 TEST_RESOURCE_SENSORS_AVAILABLE=false run_doctor "$TEMP_ROOT/v02-without-resource-sensors.json" \
     --target minimalist-v02 --json
@@ -240,10 +249,27 @@ grep -Fq 'topology=minimalist-v04-pager' "$TEMP_ROOT/supported-pager.json" \
 
 workspaces_panel=${supported_panel//signature=minimalist-v04/signature=minimalist-v04-workspaces}
 workspaces_panel=${workspaces_panel/transition=v04-target/transition=v04-workspaces-target}
+workspaces_panel=${workspaces_panel/widgetTypes=$v04_widgets/widgetTypes=$workspaces_widgets}
 TEST_QDBUS_RESULT="$workspaces_panel" run_doctor "$TEMP_ROOT/supported-workspaces.json" --json
 [[ $DOCTOR_STATUS == 0 ]] || fail "recognized Workspaces-preview topology was not supported"
 grep -Fq 'topology=minimalist-v04-workspaces' "$TEMP_ROOT/supported-workspaces.json" \
     || fail "doctor omitted the recognized Workspaces-preview topology"
+
+duplicate_tail_panel=${workspaces_panel//signature=minimalist-v04-workspaces/signature=minimalist-v04-workspaces-duplicate-tail}
+duplicate_tail_panel=${duplicate_tail_panel/transition=v04-workspaces-target/transition=recover-v04-workspaces-duplicate-tail}
+duplicate_tail_panel=${duplicate_tail_panel/targetComplete=true/targetComplete=false}
+duplicate_tail_panel=${duplicate_tail_panel/noDuplicateTargetWidgets=true/noDuplicateTargetWidgets=false}
+duplicate_tail_panel=${duplicate_tail_panel/widgetTypes=$workspaces_widgets/widgetTypes=$workspaces_widgets';org.kde.minimalist.activewindowtitle;org.kde.minimalist.resources'}
+TEST_QDBUS_RESULT="$duplicate_tail_panel" run_doctor "$TEMP_ROOT/degraded-duplicate-tail.json" --json
+[[ $DOCTOR_STATUS == 1 ]] || fail "exact Workspaces duplicate tail was not classified as degraded"
+"$NODE_BIN" - "$TEMP_ROOT/degraded-duplicate-tail.json" <<'NODE'
+const fs = require("fs");
+const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (report.status !== "degraded" || report.exit_code !== 1) process.exit(1);
+if (report.checks.panels.status !== "degraded"
+    || !report.checks.panels.detail.includes("recover-v04-workspaces-duplicate-tail")) process.exit(2);
+if (report.checks.panel_opacity_transition.status !== "supported") process.exit(3);
+NODE
 
 run_doctor "$TEMP_ROOT/supported.json" --json
 [[ $DOCTOR_STATUS == 0 ]] || fail "supported JSON doctor exited $DOCTOR_STATUS"
@@ -354,6 +380,11 @@ grep -Fq 'linux-workstation host prerequisite outside kde-rice package ownership
     "$TEMP_ROOT/missing-fastfetch.json" \
     || fail "missing Fastfetch did not report the linux-workstation ownership boundary"
 ln -s mock-command "$MOCK_BIN/fastfetch"
+
+TEST_FONTS='Noto Sans' run_doctor "$TEMP_ROOT/missing-terminal-font.json" --json
+[[ $DOCTOR_STATUS == 2 ]] || fail "missing Hack did not exit unsupported"
+grep -Fq 'missing font families: Hack' "$TEMP_ROOT/missing-terminal-font.json" \
+    || fail "missing terminal font reason is wrong"
 
 TEST_FASTFETCH_VERSION=2.39.0 run_doctor "$TEMP_ROOT/old-fastfetch.json" --json
 [[ $DOCTOR_STATUS == 2 ]] || fail "old Fastfetch did not exit unsupported"
